@@ -129,6 +129,16 @@ Item {
 
   function toggle() { setEnabled(!enabled) }
 
+  // Explicitly claim the display back. Startup deliberately refuses to seize a
+  // warm display it did not set, so this is the way out when something else
+  // parked it warm and never released.
+  function adopt() {
+    root.adoptOnNextProbe = true
+    root.yielded = false
+    root.settled = false
+    root.tick()
+  }
+
   function abandonInFlight() {
     root.probePending = false
     root.samplePending = false
@@ -561,12 +571,6 @@ Item {
     function refresh(): void { root.settled = false; root.tick() }
 
     // Explicit "take the display back" without cycling the enable flag.
-    function adopt(): string {
-      root.adoptOnNextProbe = true
-      root.yielded = false
-      root.settled = false
-      root.tick()
-      return "adopting"
-    }
+    function adopt(): string { root.adopt(); return "adopting" }
   }
 }

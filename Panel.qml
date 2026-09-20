@@ -136,6 +136,19 @@ Panel {
               elide: Text.ElideRight
               maximumLineCount: 1
             }
+
+            // Paused means something else holds the display. Without an action
+            // here the state is a dead end: startup will not seize a warm
+            // display it did not set, so the user needs a way to say "mine".
+            Button {
+              visible: root.serviceReady && root.service.yielded === true && root.on
+              text: "Take over"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: { if (root.service && root.service.adopt) root.service.adopt() }
+            }
           }
 
           ToggleSwitch {
@@ -269,7 +282,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "How far the display moves toward the room colour. Higher is more dramatic."
+            text: "Higher follows the room more closely."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -318,7 +331,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "The display will not go warmer than this, however warm the room gets."
+            text: "The display will never go warmer than this."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -363,6 +376,15 @@ Panel {
             integer: true
             value: root.serviceReady ? root.service.pollIntervalSec : 2
             onMoved: function (v) { root.setSetting("pollIntervalSec", v) }
+          }
+
+          Text {
+            width: parent.width
+            text: "Lower reacts faster and wakes the laptop more often."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
         }
 
