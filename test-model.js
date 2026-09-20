@@ -185,6 +185,26 @@ test("resumes after Night Light returns to neutral, even at a value we once set"
   assert.strictEqual(o.atNeutral, true)
 })
 
+test("hyprsunset's own 6000K default counts as free, not as a foreign owner", function () {
+  // The cold-boot bug: hyprsunset starts at 6000K, and testing for "near
+  // 6500" read that as somebody else holding a warm display, so the plugin
+  // yielded forever and never adapted.
+  var o = M.evaluateOwnership(6000, null)
+  assert.strictEqual(o.atNeutral, true)
+  assert.strictEqual(o.shouldYield, false)
+})
+
+test("anything at or above the identity point is free", function () {
+  assert.strictEqual(M.evaluateOwnership(6200, null).shouldYield, false)
+  assert.strictEqual(M.evaluateOwnership(6500, null).shouldYield, false)
+})
+
+test("just below the identity point is still somebody else's", function () {
+  // 4000K is Night Light. 5900K is someone warming it deliberately.
+  assert.strictEqual(M.evaluateOwnership(5900, null).shouldYield, true)
+  assert.strictEqual(M.evaluateOwnership(4000, null).shouldYield, true)
+})
+
 test("treats an unknown temperature as not ours", function () {
   var o = M.evaluateOwnership(null, 4250)
   assert.strictEqual(o.shouldYield, true)

@@ -5,6 +5,14 @@
 // is never what ambient adaptation wants, so it doubles as our ceiling.
 var NEUTRAL_K = 6500
 
+// At or above this the display is not warmed by anybody, so it is free to
+// take. This is Omarchy's own definition: omarchy-toggle-nightlight and
+// NightlightModel.js both call a temperature below 6000 "night light on".
+// It matters because hyprsunset's own default on a fresh start is 6000, not
+// 6500, and testing for "near 6500" read that as a foreign owner and parked
+// the plugin permanently on a cold boot.
+var IDENTITY_K = 6000
+
 var DEFAULTS = {
   // How far to move from neutral toward the room. Apple's True Tone is a
   // partial adaptation, not a match: your eye is already adapting, so the
@@ -209,7 +217,7 @@ function evaluateOwnership(appliedK, lastSetK, tolerance) {
   if (appliedK === null || appliedK === undefined) {
     return { owned: false, atNeutral: false, shouldYield: true }
   }
-  var atNeutral = Math.abs(appliedK - NEUTRAL_K) <= t
+  var atNeutral = appliedK >= IDENTITY_K
   var owned = (lastSetK !== null && lastSetK !== undefined)
     && Math.abs(appliedK - lastSetK) <= t
   return { owned: owned, atNeutral: atNeutral, shouldYield: !owned && !atNeutral }
@@ -382,6 +390,7 @@ function describe(reading, targetK) {
 if (typeof module !== "undefined") {
   module.exports = {
     NEUTRAL_K: NEUTRAL_K,
+    IDENTITY_K: IDENTITY_K,
     DEFAULTS: DEFAULTS,
     scanCommand: scanCommand,
     parseScan: parseScan,
