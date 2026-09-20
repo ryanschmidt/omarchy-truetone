@@ -107,11 +107,13 @@ it takes about 6% off green and 9% off blue; in daylight it does nothing at all,
 because the correction scales with distance from D65 and neutral light is already
 there.
 
-**Measured chromaticity, not just temperature.** Warmth is interpolated in
-Kelvin, and the off-locus part of the measured colour is carried across
-separately. This is what a colour sensor buys you over a lux sensor: cheap LED
-and fluorescent lighting sits visibly off the blackbody curve, and matching only
-its correlated temperature leaves the green or magenta cast behind.
+**Measured chromaticity, not just temperature.** It interpolates in CIE xy from
+D65 straight toward the colour the sensor actually measured, so an illuminant off
+the blackbody curve is handled with no special case. This is what a colour sensor
+buys you over a lux sensor: cheap LED and fluorescent lighting sits visibly off
+that curve, and matching only its correlated temperature leaves the green or
+magenta cast behind. Anchoring on D65 also means a neutral room gets exactly no
+correction.
 
 **A blue floor and no boosting.** A gamma ramp can only attenuate channels, so
 the result is always a white-point shift and never a brightness change, and the
