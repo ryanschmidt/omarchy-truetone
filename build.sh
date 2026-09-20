@@ -16,7 +16,7 @@ wayland-scanner private-code  wlr-gamma-control-unstable-v1.xml \
 
 gcc -O2 -Wall -o truetone-gamma truetone-gamma.c \
   wlr-gamma-control-unstable-v1-protocol.c \
-  $(pkg-config --cflags --libs wayland-client)
+  $(pkg-config --cflags --libs wayland-client) -lm
 
 rm -f wlr-gamma-control-unstable-v1-protocol.c
 echo "built: $(pwd)/truetone-gamma"

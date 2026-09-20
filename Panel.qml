@@ -90,12 +90,25 @@ Panel {
     bar: root.bar
     open: root.opened
     contentWidth: popup.fittedContentWidth(Style.space(320))
-    contentHeight: popup.fittedContentHeight(column.implicitHeight, Style.space(420))
+    contentHeight: popup.fittedContentHeight(column.implicitHeight, Style.space(460))
 
-    Column {
-      id: column
-      width: popup.width > 0 ? popup.contentWidth : Style.space(320)
-      spacing: Style.space(10)
+    // The Flickable is what gives the Column a resolved width to lay out
+    // against. Without it the height binding could not settle and the card
+    // clipped its own content.
+    Flickable {
+      id: flick
+      anchors.fill: parent
+      contentWidth: width
+      contentHeight: column.implicitHeight
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+      interactive: contentHeight > height
+      ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+      Column {
+        id: column
+        width: flick.width
+        spacing: Style.space(10)
 
       // ---- header with the only control there is ----
       Item {
@@ -218,5 +231,6 @@ Panel {
         font.pixelSize: Style.font.caption
       }
     }
+  }
   }
 }

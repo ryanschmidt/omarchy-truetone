@@ -33,6 +33,7 @@
 #include <signal.h>
 #include <poll.h>
 #include <libgen.h>
+#include <math.h>
 #include <wayland-client.h>
 #include "wlr-gamma-control-unstable-v1-client-protocol.h"
 
@@ -104,6 +105,24 @@ static const struct zwlr_gamma_control_v1_listener gamma_listener = {
 
 // ---- ramp writing ----------------------------------------------------------
 
+// A gamma ramp maps ENCODED values, and the display then applies its transfer
+// function to produce light. Multiplying the ramp by a gain therefore scales
+// the emitted light by roughly gain^2.2, not by gain.
+//
+// The gains arriving here are linear-light ratios from the colour maths, so
+// applying them straight to the ramp over-corrected by about double: an
+// intended blue ratio of 0.485 emitted 0.485^2.2 = 0.199 of the blue light.
+// Decode each entry to linear, scale there, and re-encode.
+static double srgb_decode(double v) {
+  return (v <= 0.04045) ? (v / 12.92) : pow((v + 0.055) / 1.055, 2.4);
+}
+
+static double srgb_encode(double l) {
+  if (l <= 0.0) return 0.0;
+  if (l >= 1.0) return 1.0;
+  return (l <= 0.0031308) ? (12.92 * l) : (1.055 * pow(l, 1.0 / 2.4) - 0.055);
+}
+
 static void apply_one(struct output_state *o, double r, double g, double b) {
   if (!o->ready || !o->table || o->failed) return;
 
@@ -113,11 +132,11 @@ static void apply_one(struct output_state *o, double r, double g, double b) {
   uint16_t *B = o->table + 2 * n;
 
   for (uint32_t i = 0; i < n; i++) {
-    double v = (n > 1) ? ((double)i / (double)(n - 1)) * 65535.0 : 0.0;
-    double vr = v * r, vg = v * g, vb = v * b;
-    R[i] = (uint16_t)(vr < 0 ? 0 : (vr > 65535 ? 65535 : vr));
-    G[i] = (uint16_t)(vg < 0 ? 0 : (vg > 65535 ? 65535 : vg));
-    B[i] = (uint16_t)(vb < 0 ? 0 : (vb > 65535 ? 65535 : vb));
+    double v = (n > 1) ? ((double)i / (double)(n - 1)) : 0.0;
+    double lin = srgb_decode(v);
+    R[i] = (uint16_t)(srgb_encode(lin * r) * 65535.0 + 0.5);
+    G[i] = (uint16_t)(srgb_encode(lin * g) * 65535.0 + 0.5);
+    B[i] = (uint16_t)(srgb_encode(lin * b) * 65535.0 + 0.5);
   }
 
   // set_gamma consumes the fd, so hand over a duplicate and keep ours.

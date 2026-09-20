@@ -74,6 +74,15 @@ test("rejects impossible chromaticity", function () {
 
 console.log("\ncolour: adaptation")
 
+test("the correction is subtle, not a blue-light filter", function () {
+  // The whole point of the review: it was cutting blue by 78% of emitted
+  // light. True Tone is something you notice when you toggle it, not a
+  // night mode.
+  var g = M.adaptGains(1997, 0.531, 0.420)
+  assert.ok(g.b > 0.6, "still too aggressive: b=" + g.b)
+  assert.ok(g.g > 0.7, "still too aggressive: g=" + g.g)
+})
+
 test("a warm room warms the display, attenuating blue most", function () {
   // Measured on the XPS 14 under an evening lamp.
   var g = M.adaptGains(1997, 0.531, 0.420)
@@ -81,9 +90,12 @@ test("a warm room warms the display, attenuating blue most", function () {
   assert.strictEqual(g.r, 1)
 })
 
-test("a neutral room leaves the display alone", function () {
+test("a neutral room gets EXACTLY no correction", function () {
+  // Regression, codex review: the anchor used to sit on the Planckian locus
+  // at 6500K, which is (0.3135, 0.3237) against D65's (0.3127, 0.3290). That
+  // cut green by 5.6% in a perfectly neutral room.
   var g = M.adaptGains(6500, 0.3127, 0.3290)
-  assert.ok(g.b > 0.97, "over-corrected a neutral room: " + JSON.stringify(g))
+  assert.deepStrictEqual({ r: g.r, g: g.g, b: g.b }, { r: 1, g: 1, b: 1 })
 })
 
 test("a cool room does not tint the panel blue", function () {
@@ -95,7 +107,9 @@ test("a cool room does not tint the panel blue", function () {
 
 test("moves partway, never all the way", function () {
   var g = M.adaptGains(2000, null, null)
-  assert.ok(g.targetK > 4000 && g.targetK < 4500, "targetK=" + g.targetK)
+  // Well short of the room, and well short of a night-mode shift.
+  assert.ok(g.targetK > 5000 && g.targetK < M.D65_K, "targetK=" + g.targetK)
+  assert.ok(g.b > 0.6, "b=" + g.b)
 })
 
 test("respects the blue floor in candlelight", function () {
@@ -120,6 +134,23 @@ test("survives a sensor with no chromaticity channel", function () {
 test("rejects a nonsense reading", function () {
   assert.strictEqual(M.adaptGains(0, 0.3, 0.3), null)
   assert.strictEqual(M.adaptGains(NaN, 0.3, 0.3), null)
+})
+
+test("chromaticity and temperature are smoothed together", function () {
+  // Regression, codex review: a smoothed CCT paired with raw or stale xy
+  // manufactured tint during a transition.
+  var a = M.smoothReading(null, { cct: 2000, x: 0.5, y: 0.41 })
+  assert.deepStrictEqual(a, { cct: 2000, x: 0.5, y: 0.41 })
+  var b = M.smoothReading(a, { cct: 5000, x: 0.35, y: 0.35 })
+  assert.ok(b.cct > 2000 && b.cct < 5000, "cct not damped")
+  assert.ok(b.x < 0.5 && b.x > 0.35, "x not damped")
+  assert.ok(b.y < 0.41 && b.y > 0.35, "y not damped")
+})
+
+test("a missing chromaticity channel keeps the previous value", function () {
+  var a = M.smoothReading(null, { cct: 3000, x: 0.44, y: 0.40 })
+  var b = M.smoothReading(a, { cct: 3000, x: null, y: null })
+  assert.strictEqual(b.x, 0.44)
 })
 
 console.log("\nmotion")

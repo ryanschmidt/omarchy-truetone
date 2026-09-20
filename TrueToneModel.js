@@ -13,15 +13,16 @@ var D65_X = 0.3127
 var D65_Y = 0.3290
 var D65_K = 6500
 
-// How far to move from D65 toward the room. True Tone is a partial
+// How far to move from D65 toward the room, in CIE xy. True Tone is a partial
 // adaptation, not a match: your eye is already adapting, so the display only
-// closes part of the gap. Adapting fully to a 2000K lamp looks alarmingly
-// orange. This is the one number that decides how the feature feels.
-var STRENGTH = 0.5
+// closes part of the gap. This is the one number that decides how the feature
+// feels, and it is deliberately small. An earlier 0.5 was chosen before the
+// transfer-function bug below was found, and it was doubling on top of that.
+var STRENGTH = 0.14
 
 // The warmest white point we will produce, as a floor on the blue channel.
-// Without it a candle-lit room would drive blue toward zero.
-var MIN_BLUE_GAIN = 0.42
+// Only reached in candlelight at this strength.
+var MIN_BLUE_GAIN = 0.60
 
 // Below this the colour channel has too few photons to mean anything.
 // Measured on a Dell XPS 14: readings stay coherent down to about 7 lux.
@@ -146,42 +147,54 @@ function xyToGains(x, y) {
 
 // The whole feature.
 //
-// Warmth is interpolated in Kelvin and the off-locus component of the
-// measured chromaticity is carried across separately. That second part is
-// what a Kelvin-only approach cannot do, and it is why a colour sensor is
-// required: cheap LED and fluorescent lighting sits visibly off the blackbody
-// curve, and matching only its correlated temperature leaves the cast behind.
+// Interpolate in CIE xy straight from D65 toward the measured room colour.
+// Two properties matter and both were wrong before:
+//
+//   Strength 0 is exactly D65, so a neutral room gets exactly no correction.
+//   The previous version anchored on the Planckian locus at 6500K, which is
+//   (0.3135, 0.3237) against D65's (0.3127, 0.3290), and so cut green by 5.6%
+//   in a perfectly neutral room.
+//
+//   The measured chromaticity is used directly, so an off-locus illuminant is
+//   handled with no separate term. This is what a colour sensor buys over a
+//   lux sensor: cheap LED and fluorescent lighting sits visibly off the
+//   blackbody curve, and matching only its correlated temperature leaves the
+//   green or magenta cast behind.
 function adaptGains(ambientK, ambientX, ambientY) {
   if (!isFinite(ambientK) || ambientK <= 0) return null
 
-  var targetK = D65_K + STRENGTH * (ambientK - D65_K)
-  if (targetK > D65_K) targetK = D65_K          // never tint the panel blue
-
-  var target = locusXY(targetK)
-  var tx = target.x
-  var ty = target.y
-
-  // Carry the measured tint, scaled the same way the warmth was.
-  if (isFinite(ambientX) && isFinite(ambientY) && ambientX > 0 && ambientY > 0) {
-    var measuredLocus = locusXY(ambientK)
-    tx += STRENGTH * (ambientX - measuredLocus.x)
-    ty += STRENGTH * (ambientY - measuredLocus.y)
+  var ax = ambientX, ay = ambientY
+  if (!isFinite(ax) || !isFinite(ay) || ax <= 0 || ay <= 0) {
+    // No chromaticity channel: fall back to the locus point for this CCT.
+    var l = locusXY(ambientK)
+    ax = l.x; ay = l.y
   }
+
+  // Never adapt toward a cooler white than D65. A gamma ramp can only
+  // attenuate, so "bluer" would mean darkening red and green.
+  if (ambientK > D65_K) { ax = D65_X; ay = D65_Y }
+
+  var tx = D65_X + STRENGTH * (ax - D65_X)
+  var ty = D65_Y + STRENGTH * (ay - D65_Y)
 
   var gains = xyToGains(tx, ty)
   if (!gains) return null
 
-  // Bound how warm this can get, keeping the hue by scaling green with blue.
+  // Bound how warm this can get.
   if (gains.b < MIN_BLUE_GAIN) {
-    var lift = MIN_BLUE_GAIN / gains.b
+    var scale = MIN_BLUE_GAIN / gains.b
     gains.b = MIN_BLUE_GAIN
-    gains.g = Math.min(1, gains.g * Math.sqrt(lift))
+    gains.g = Math.min(1, gains.g * scale)
   }
+
   return {
     r: round3(gains.r),
     g: round3(gains.g),
     b: round3(gains.b),
-    targetK: Math.round(targetK)
+    // Reported for the panel only. Nothing downstream uses it. Clamped the
+    // same way the gains are, so a cool room reads as D65 rather than as a
+    // cooler-than-neutral white we never actually apply.
+    targetK: Math.round(Math.min(D65_K, D65_K + STRENGTH * (ambientK - D65_K)))
   }
 }
 
@@ -197,6 +210,19 @@ function smoothCct(previous, sample) {
   if (!isFinite(sample)) return previous
   if (previous === null || previous === undefined || !isFinite(previous)) return sample
   return previous + EMA_ALPHA * (sample - previous)
+}
+
+// Chromaticity gets the same smoothing as the temperature, and from the same
+// sample. Pairing a smoothed CCT with a raw or stale xy manufactured tint
+// during a lighting transition.
+function smoothReading(previous, sample) {
+  if (!sample) return previous
+  if (!previous) return { cct: sample.cct, x: sample.x, y: sample.y }
+  return {
+    cct: smoothCct(previous.cct, sample.cct),
+    x: (sample.x === null) ? previous.x : smoothCct(previous.x, sample.x),
+    y: (sample.y === null) ? previous.y : smoothCct(previous.y, sample.y)
+  }
 }
 
 // Walk each channel toward the target. Returns null when already there.
@@ -275,7 +301,7 @@ if (typeof module !== "undefined") {
     scanCommand: scanCommand, parseScan: parseScan, pickSensor: pickSensor,
     hasUsableLight: hasUsableLight,
     locusXY: locusXY, xyToGains: xyToGains, adaptGains: adaptGains,
-    smoothCct: smoothCct, stepGains: stepGains, isSettled: isSettled,
+    smoothCct: smoothCct, smoothReading: smoothReading, stepGains: stepGains, isSettled: isSettled,
     pollIntervalFor: pollIntervalFor, setCommand: setCommand,
     statePath: statePath, loadStateCommand: loadStateCommand,
     saveStateCommand: saveStateCommand, parseState: parseState,

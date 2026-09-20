@@ -31,7 +31,7 @@ Item {
   property int outputCount: 0
 
   property var reading: null          // { cct, lux, x, y }
-  property var smoothedCct: null
+  property var smoothed: null    // EMA of { cct, x, y }, smoothed together
   property var previousCct: null
   property var targetGains: null
   property var appliedGains: null
@@ -79,7 +79,7 @@ Item {
       root.targetGains = null
       root.targetK = null
     } else {
-      root.smoothedCct = null
+      root.smoothed = null
       root.previousCct = null
       root.settled = false
       tick()
@@ -100,6 +100,8 @@ Item {
     root.samplePending = true
     root.sampleCct = null
     root.sampleLux = null
+    root.sampleX = null
+    root.sampleY = null
     sampleWatchdog.restart()
     // reload() is asynchronous with no ordering guarantee, so the cycle
     // completes on the arrival of both required values, not on the last
@@ -115,13 +117,16 @@ Item {
     // already closed the cycle. Dropping it as "late" silently disabled the
     // off-locus correction, which is the entire reason for reading a colour
     // sensor rather than a lux one. Accept it whenever it arrives.
-    if (which === "x") { root.sampleX = value; return }
-    if (which === "y") { root.sampleY = value; return }
-
     if (!root.samplePending) return
     if (which === "cct") root.sampleCct = value
     else if (which === "lux") root.sampleLux = value
-    if (root.sampleCct !== null && root.sampleLux !== null) completeSample()
+    else if (which === "x") root.sampleX = value
+    else if (which === "y") root.sampleY = value
+
+    // Wait for the whole set so chromaticity and temperature describe the
+    // same instant. The watchdog covers a channel that never arrives.
+    if (root.sampleCct !== null && root.sampleLux !== null
+        && root.sampleX !== null && root.sampleY !== null) completeSample()
   }
 
   function completeSample() {
@@ -144,8 +149,8 @@ Item {
       return
     }
 
-    root.smoothedCct = Model.smoothCct(root.smoothedCct, cct)
-    var goal = Model.adaptGains(root.smoothedCct, x, y)
+    root.smoothed = Model.smoothReading(root.smoothed, { cct: cct, x: x, y: y })
+    var goal = Model.adaptGains(root.smoothed.cct, root.smoothed.x, root.smoothed.y)
     if (goal) {
       root.targetGains = { r: goal.r, g: goal.g, b: goal.b }
       root.targetK = goal.targetK
