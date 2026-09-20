@@ -1,2 +1,5 @@
+truetone-gamma
+*-client-protocol.h
+*-protocol.c
 node_modules/
 *.log

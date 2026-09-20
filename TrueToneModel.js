@@ -1,44 +1,52 @@
 // Pure logic for True Tone. No QML, no I/O, so it runs under node for tests.
-// Mirrors the shape of Omarchy's own NightlightModel.js.
+//
+// True Tone has no settings, the same as on a Mac: it is on or off. Night
+// Light owns the Kelvin slider, and this owns nothing but the white point.
+// The constants below are the product, not configuration.
 
-// hyprsunset's identity point. Going above this tints the panel blue, which
-// is never what ambient adaptation wants, so it doubles as our ceiling.
-var NEUTRAL_K = 6500
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-// At or above this the display is not warmed by anybody, so it is free to
-// take. This is Omarchy's own definition: omarchy-toggle-nightlight and
-// NightlightModel.js both call a temperature below 6000 "night light on".
-// It matters because hyprsunset's own default on a fresh start is 6000, not
-// 6500, and testing for "near 6500" read that as a foreign owner and parked
-// the plugin permanently on a cold boot.
-var IDENTITY_K = 6000
+// D65. Every display is built to call this white, so it is what we adapt from.
+var D65_X = 0.3127
+var D65_Y = 0.3290
+var D65_K = 6500
 
-var DEFAULTS = {
-  // How far to move from neutral toward the room. Apple's True Tone is a
-  // partial adaptation, not a match: your eye is already adapting, so the
-  // display only closes part of the gap. Full adaptation to a 2000K lamp
-  // would look alarmingly orange.
-  strength: 0.5,
-  minKelvin: 3800,
-  maxKelvin: NEUTRAL_K,
-  // Below this the color channel has too few photons to mean anything.
-  // Measured on a Dell XPS 14: readings stay coherent down to ~7 lux.
-  luxFloor: 3,
-  // Sensor noise measured at roughly +/- 20K, so this mostly smooths real
-  // transitions rather than jitter.
-  emaAlpha: 0.3,
-  // Don't bother hyprsunset for changes the eye cannot see.
-  deadbandK: 25,
-  // Per tick. At a 1s poll this crosses the full range in about 30s.
-  maxStepK: 100
-}
+// How far to move from D65 toward the room. True Tone is a partial
+// adaptation, not a match: your eye is already adapting, so the display only
+// closes part of the gap. Adapting fully to a 2000K lamp looks alarmingly
+// orange. This is the one number that decides how the feature feels.
+var STRENGTH = 0.5
+
+// The warmest white point we will produce, as a floor on the blue channel.
+// Without it a candle-lit room would drive blue toward zero.
+var MIN_BLUE_GAIN = 0.42
+
+// Below this the colour channel has too few photons to mean anything.
+// Measured on a Dell XPS 14: readings stay coherent down to about 7 lux.
+var LUX_FLOOR = 3
+
+// Sensor noise sits around +/- 20K, so this mostly smooths real transitions.
+var EMA_ALPHA = 0.3
+
+// Per tick, in gain units. A step change in white point is very visible in
+// peripheral vision, so we walk there instead.
+var MAX_GAIN_STEP = 0.012
+
+// Changes smaller than this are invisible; do not spend a write on them.
+var GAIN_DEADBAND = 0.004
+
+// Room lighting changes over minutes, so a fixed fast poll spends its whole
+// budget confirming that nothing happened.
+var FAST_INTERVAL_SEC = 2
+var IDLE_INTERVAL_SEC = 20
+var STABLE_CCT_DELTA_K = 40
 
 // ---------------------------------------------------------------------------
 // Sensor discovery
 // ---------------------------------------------------------------------------
 
-// Emit one line per IIO device: path|name|hasColortemp|hasChromaticity|hasLux
-// Kept as a single shell string because QML's Process wants argv, not a script.
 function scanCommand() {
   return ["bash", "-lc",
     'for d in /sys/bus/iio/devices/iio:device*; do ' +
@@ -69,353 +77,208 @@ function parseScan(text) {
   return out
 }
 
-// THE fix. Every other ALS consumer takes the first device named `als` and
-// stops. A Dell XPS 14 has two: iio:device1 is lux-only and sorts first,
-// iio:device2 carries the color channel. Taking the first one silently
-// disables adaptive color on exactly the hardware that can do it.
+// Other ALS consumers take the first IIO device named `als` and stop. A Dell
+// XPS 14 has two: iio:device1 is lux-only and sorts first, iio:device2 carries
+// the colour channel. Taking the first silently disables adaptive colour on
+// exactly the hardware that supports it.
 function pickSensor(devices) {
   if (!devices || !devices.length) return null
   var lux = null
   for (var i = 0; i < devices.length; i++) {
     var d = devices[i]
     if (d.name !== "als") continue
-    if (d.hasColortemp && d.hasLux) return d   // what we actually want
-    if (d.hasLux && !lux) lux = d              // remembered only to explain why we can't run
+    if (d.hasColortemp && d.hasLux) return d
+    if (d.hasLux && !lux) lux = d
   }
   return lux
 }
 
-// ---------------------------------------------------------------------------
-// Sensor reading
-// ---------------------------------------------------------------------------
-
-function readCommand(path) {
-  return ["bash", "-lc",
-    'd=' + JSON.stringify(path) + '; ' +
-    'echo "cct=$(cat $d/in_colortemp_raw 2>/dev/null)"; ' +
-    'echo "cctscale=$(cat $d/in_colortemp_scale 2>/dev/null)"; ' +
-    'echo "lux=$(cat $d/in_illuminance_raw 2>/dev/null)"; ' +
-    'echo "luxscale=$(cat $d/in_illuminance_scale 2>/dev/null)"; ' +
-    'echo "x=$(cat $d/in_chromaticity_x_raw 2>/dev/null)"; ' +
-    'echo "y=$(cat $d/in_chromaticity_y_raw 2>/dev/null)"; ' +
-    'echo "xyscale=$(cat $d/in_chromaticity_scale 2>/dev/null)"'
-  ]
-}
-
-function parseReading(text) {
-  var kv = {}
-  var lines = String(text || "").split("\n")
-  for (var i = 0; i < lines.length; i++) {
-    var eq = lines[i].indexOf("=")
-    if (eq > 0) kv[lines[i].slice(0, eq)] = lines[i].slice(eq + 1)
-  }
-  var num = function (k) {
-    var v = parseFloat(kv[k])
-    return isFinite(v) ? v : null
-  }
-  var scale = function (k, fallback) {
-    var v = parseFloat(kv[k])
-    return isFinite(v) && v > 0 ? v : fallback
-  }
-
-  var cctRaw = num("cct")
-  var luxRaw = num("lux")
-  if (cctRaw === null || luxRaw === null) return null
-
-  var xyScale = scale("xyscale", 0.001)
-  return {
-    cct: cctRaw * scale("cctscale", 0.001),
-    lux: luxRaw * scale("luxscale", 0.001),
-    x: num("x") === null ? null : num("x") * xyScale,
-    y: num("y") === null ? null : num("y") * xyScale
-  }
+function hasUsableLight(lux) {
+  return isFinite(lux) && lux >= LUX_FLOOR
 }
 
 // ---------------------------------------------------------------------------
-// Adaptation
+// Colour
 // ---------------------------------------------------------------------------
 
-// Clamp the EFFECTIVE options, after merging, not just the ones that arrived
-// from the config file. Validating only what the file supplied let a lone
-// `minKelvin = 9000` sail past the pairwise check and produce a 9000K target,
-// and a negative `maxStepK` ramp the wrong way.
-function sanitizeOptions(o) {
-  o.strength = clampNumber(o.strength, 0, 1, DEFAULTS.strength)
-  o.maxKelvin = clampNumber(o.maxKelvin, 1000, NEUTRAL_K, NEUTRAL_K)
-  o.minKelvin = clampNumber(o.minKelvin, 1000, NEUTRAL_K, DEFAULTS.minKelvin)
-  if (o.minKelvin > o.maxKelvin) o.minKelvin = o.maxKelvin
-  o.luxFloor = clampNumber(o.luxFloor, 0, 100000, DEFAULTS.luxFloor)
-  o.emaAlpha = clampNumber(o.emaAlpha, 0.01, 1, DEFAULTS.emaAlpha)
-  o.deadbandK = clampNumber(o.deadbandK, 0, 5000, DEFAULTS.deadbandK)
-  // A zero or negative step never converges, or converges away from target.
-  // Clamping those to 1 would be safe but glacial, so treat them as invalid
-  // and fall back to the default instead.
-  var step = Number(o.maxStepK)
-  o.maxStepK = (isFinite(step) && step >= 1) ? Math.min(step, 5000) : DEFAULTS.maxStepK
-  return o
+// Planckian locus, Kim et al. cubic approximation. Used to separate the
+// measured chromaticity into "how warm" and "how far off the curve", so the
+// two can be scaled independently.
+function locusXY(T) {
+  var x
+  if (T <= 4000) {
+    x = -0.2661239e9 / (T * T * T) - 0.2343589e6 / (T * T) + 0.8776956e3 / T + 0.179910
+  } else {
+    x = -3.0258469e9 / (T * T * T) + 2.1070379e6 / (T * T) + 0.2226347e3 / T + 0.240390
+  }
+  var y
+  if (T <= 2222) {
+    y = -1.1063814 * x * x * x - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
+  } else if (T <= 4000) {
+    y = -0.9549476 * x * x * x - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
+  } else {
+    y = 3.0817580 * x * x * x - 5.87338670 * x * x + 3.75112997 * x - 0.37001483
+  }
+  return { x: x, y: y }
 }
 
-function clampNumber(value, low, high, fallback) {
-  var v = Number(value)
-  if (!isFinite(v)) return fallback
-  return Math.max(low, Math.min(high, v))
+// CIE xy -> linear sRGB gains, normalised so nothing exceeds 1.
+//
+// A gamma ramp is a per-channel curve, so only a diagonal transform is
+// available: we can attenuate channels, never boost one. Normalising to the
+// brightest channel is what keeps the result a white-point shift rather than
+// a brightness change.
+function xyToGains(x, y) {
+  if (!isFinite(x) || !isFinite(y) || y <= 0) return null
+  var X = x / y
+  var Y = 1.0
+  var Z = (1 - x - y) / y
+
+  var r = 3.2406 * X - 1.5372 * Y - 0.4986 * Z
+  var g = -0.9689 * X + 1.8758 * Y + 0.0415 * Z
+  var b = 0.0557 * X - 0.2040 * Y + 1.0570 * Z
+
+  r = Math.max(0, r); g = Math.max(0, g); b = Math.max(0, b)
+  var m = Math.max(r, g, b)
+  if (!(m > 0)) return null
+  return { r: r / m, g: g / m, b: b / m }
 }
 
-function optionsWithDefaults(opts) {
-  var o = {}
-  for (var k in DEFAULTS) o[k] = DEFAULTS[k]
-  if (opts) for (var j in opts) if (opts[j] !== undefined && opts[j] !== null) o[j] = opts[j]
-  return sanitizeOptions(o)
-}
-
-function hasUsableLight(lux, opts) {
-  var o = optionsWithDefaults(opts)
-  return isFinite(lux) && lux >= o.luxFloor
-}
-
-// Partial chromatic adaptation, clamped. This is the whole feature in one line.
-function adaptTarget(ambientK, opts) {
-  var o = optionsWithDefaults(opts)
+// The whole feature.
+//
+// Warmth is interpolated in Kelvin and the off-locus component of the
+// measured chromaticity is carried across separately. That second part is
+// what a Kelvin-only approach cannot do, and it is why a colour sensor is
+// required: cheap LED and fluorescent lighting sits visibly off the blackbody
+// curve, and matching only its correlated temperature leaves the cast behind.
+function adaptGains(ambientK, ambientX, ambientY) {
   if (!isFinite(ambientK) || ambientK <= 0) return null
-  var target = NEUTRAL_K + o.strength * (ambientK - NEUTRAL_K)
-  return Math.round(Math.max(o.minKelvin, Math.min(o.maxKelvin, target)))
-}
 
-function smooth(previous, sample, opts) {
-  var o = optionsWithDefaults(opts)
-  if (!isFinite(sample)) return previous
-  if (!isFinite(previous) || previous === null) return sample
-  return previous + o.emaAlpha * (sample - previous)
-}
+  var targetK = D65_K + STRENGTH * (ambientK - D65_K)
+  if (targetK > D65_K) targetK = D65_K          // never tint the panel blue
 
-// Ramp instead of jumping. hyprsunset applies instantly and a step change in
-// white point is very visible in peripheral vision.
-function nextStep(currentK, targetK, opts) {
-  var o = optionsWithDefaults(opts)
-  if (!isFinite(targetK)) return null
-  if (!isFinite(currentK) || currentK === null) return Math.round(targetK)
-  var delta = targetK - currentK
-  if (Math.abs(delta) <= o.deadbandK) return null
-  var step = Math.max(-o.maxStepK, Math.min(o.maxStepK, delta))
-  return Math.round(currentK + step)
-}
+  var target = locusXY(targetK)
+  var tx = target.x
+  var ty = target.y
 
-// Who owns the colour transform right now.
-//
-// Replaces an earlier "did it change from what we set" test, which had two
-// holes. Before we had set anything, `lastSetK` was null and the test returned
-// false, so starting up while Night Light already held 4000K read as "nothing
-// is happening" and we stamped over it. And once Night Light returned the
-// display to a value we had previously set ourselves, the test also returned
-// false, so the resume branch never ran and we stayed paused forever.
-//
-// The rule is positional, not historical: we own the display when it shows
-// what we last put there. If it does not, whoever warmed it owns it, unless it
-// is sitting at neutral, in which case the field is free and we may take it.
-function evaluateOwnership(appliedK, lastSetK, tolerance) {
-  var t = (tolerance === undefined) ? 60 : tolerance
-  if (appliedK === null || appliedK === undefined) {
-    return { owned: false, atNeutral: false, shouldYield: true }
+  // Carry the measured tint, scaled the same way the warmth was.
+  if (isFinite(ambientX) && isFinite(ambientY) && ambientX > 0 && ambientY > 0) {
+    var measuredLocus = locusXY(ambientK)
+    tx += STRENGTH * (ambientX - measuredLocus.x)
+    ty += STRENGTH * (ambientY - measuredLocus.y)
   }
-  var atNeutral = appliedK >= IDENTITY_K
-  var owned = (lastSetK !== null && lastSetK !== undefined)
-    && Math.abs(appliedK - lastSetK) <= t
-  return { owned: owned, atNeutral: atNeutral, shouldYield: !owned && !atNeutral }
+
+  var gains = xyToGains(tx, ty)
+  if (!gains) return null
+
+  // Bound how warm this can get, keeping the hue by scaling green with blue.
+  if (gains.b < MIN_BLUE_GAIN) {
+    var lift = MIN_BLUE_GAIN / gains.b
+    gains.b = MIN_BLUE_GAIN
+    gains.g = Math.min(1, gains.g * Math.sqrt(lift))
+  }
+  return {
+    r: round3(gains.r),
+    g: round3(gains.g),
+    b: round3(gains.b),
+    targetK: Math.round(targetK)
+  }
 }
 
+function round3(v) { return Math.round(v * 1000) / 1000 }
+
+var IDENTITY_GAINS = { r: 1, g: 1, b: 1 }
+
 // ---------------------------------------------------------------------------
-// Pacing
+// Motion
 // ---------------------------------------------------------------------------
 
-// Room lighting changes over minutes, not seconds, so a fixed fast poll spends
-// almost all of its budget confirming that nothing happened. Poll fast only
-// while something is actually moving.
-var PACING = {
-  fastIntervalSec: 2,     // converging, or the room is changing
-  idleIntervalSec: 20,    // settled
-  // A room reading wobbles by roughly +/- 20K at rest. Anything under this is
-  // not the light changing, it is the sensor breathing.
-  stableCctDeltaK: 40
+function smoothCct(previous, sample) {
+  if (!isFinite(sample)) return previous
+  if (previous === null || previous === undefined || !isFinite(previous)) return sample
+  return previous + EMA_ALPHA * (sample - previous)
 }
 
-function isSettled(state, opts) {
+// Walk each channel toward the target. Returns null when already there.
+function stepGains(current, target) {
+  if (!target) return null
+  if (!current) return { r: target.r, g: target.g, b: target.b }
+  var dr = target.r - current.r
+  var dg = target.g - current.g
+  var db = target.b - current.b
+  if (Math.abs(dr) <= GAIN_DEADBAND &&
+      Math.abs(dg) <= GAIN_DEADBAND &&
+      Math.abs(db) <= GAIN_DEADBAND) return null
+  return {
+    r: round3(current.r + clampStep(dr)),
+    g: round3(current.g + clampStep(dg)),
+    b: round3(current.b + clampStep(db))
+  }
+}
+
+function clampStep(delta) {
+  return Math.max(-MAX_GAIN_STEP, Math.min(MAX_GAIN_STEP, delta))
+}
+
+function isSettled(state) {
   if (!state) return false
-  // Still ramping toward the target: stay fast.
-  if (nextStep(state.appliedK, state.targetK, opts) !== null) return false
-  // Reading is drifting: stay fast so we catch the change early.
+  if (stepGains(state.appliedGains, state.targetGains) !== null) return false
   if (isFinite(state.previousCct) && isFinite(state.cct)) {
-    if (Math.abs(state.cct - state.previousCct) > PACING.stableCctDeltaK) return false
+    if (Math.abs(state.cct - state.previousCct) > STABLE_CCT_DELTA_K) return false
   }
   return true
 }
 
-function pollIntervalFor(settled, fastSec, idleSec) {
-  var fast = isFinite(fastSec) && fastSec > 0 ? fastSec : PACING.fastIntervalSec
-  var idle = isFinite(idleSec) && idleSec > 0 ? idleSec : PACING.idleIntervalSec
-  return settled ? Math.max(fast, idle) : fast
+function pollIntervalFor(settled) {
+  return settled ? IDLE_INTERVAL_SEC : FAST_INTERVAL_SEC
 }
 
 // ---------------------------------------------------------------------------
-// Persisted runtime state
+// Helper protocol
 // ---------------------------------------------------------------------------
 
-// The enable flag plus the last temperature we wrote. The temperature matters
-// across a shell restart: without it, our own leftover warm value looks like
-// somebody else's and the ownership check parks the plugin as "paused".
-function statePath() {
-  return "~/.local/state/omarchy-truetone/state"
+function setCommand(gains) {
+  if (!gains) return "RESET\n"
+  return "SET " + gains.r.toFixed(3) + " " + gains.g.toFixed(3) + " " + gains.b.toFixed(3) + "\n"
 }
+
+// ---------------------------------------------------------------------------
+// Persisted state: only whether the user switched it on.
+// ---------------------------------------------------------------------------
+
+function statePath() { return "~/.local/state/omarchy-truetone/enabled" }
 
 function loadStateCommand() {
-  return ["bash", "-lc", "cat " + statePath() + " 2>/dev/null || true"]
+  return ["bash", "-lc", "cat " + statePath() + " 2>/dev/null || echo 1"]
 }
 
-function saveStateCommand(enabled, lastSetK) {
-  var body = "enabled=" + (enabled ? "1" : "0") + "\n"
-    + "lastSet=" + (isFinite(lastSetK) && lastSetK !== null ? Math.round(lastSetK) : "") + "\n"
+function saveStateCommand(enabled) {
   return ["bash", "-lc",
-    "mkdir -p ~/.local/state/omarchy-truetone && cat > " + statePath() + " <<'TRUETONE_STATE_EOF'\n"
-    + body + "TRUETONE_STATE_EOF"]
+    "mkdir -p ~/.local/state/omarchy-truetone && printf '%s' " +
+    (enabled ? "1" : "0") + " > " + statePath()]
 }
 
-function parseState(text) {
-  var out = { enabled: true, lastSetK: null }
-  var lines = String(text || "").split("\n")
-  for (var i = 0; i < lines.length; i++) {
-    var eq = lines[i].indexOf("=")
-    if (eq <= 0) continue
-    var k = lines[i].slice(0, eq).trim()
-    var v = lines[i].slice(eq + 1).trim()
-    if (k === "enabled") out.enabled = v !== "0"
-    else if (k === "lastSet") {
-      var n = parseFloat(v)
-      out.lastSetK = (isFinite(n) && n > 0) ? Math.round(n) : null
-    }
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-// Hardware needs tuning a fixed model cannot see: panel white point, how warm
-// a room the owner tolerates, how twitchy their lighting is. One KEY=VALUE
-// file, same spelling as the defaults above.
-function configPath() {
-  return "~/.config/omarchy/truetone.conf"
-}
-
-function loadConfigCommand() {
-  return ["bash", "-lc", "cat " + configPath() + " 2>/dev/null || true"]
-}
-
-var NUMERIC_KEYS = ["strength", "minKelvin", "maxKelvin", "luxFloor", "emaAlpha", "deadbandK", "maxStepK", "pollIntervalSec"]
-
-function parseConfig(text) {
-  var out = {}
-  var lines = String(text || "").split("\n")
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i].trim()
-    if (!line || line.charAt(0) === "#") continue
-    var eq = line.indexOf("=")
-    if (eq <= 0) continue
-    var key = line.slice(0, eq).trim()
-    var raw = line.slice(eq + 1).trim()
-    if (NUMERIC_KEYS.indexOf(key) === -1) continue
-    var value = parseFloat(raw)
-    if (!isFinite(value)) continue
-    out[key] = value
-  }
-  // Refuse settings that would produce a broken display rather than trusting
-  // a hand-edited file.
-  if (out.strength !== undefined) out.strength = Math.max(0, Math.min(1, out.strength))
-  if (out.maxKelvin !== undefined) out.maxKelvin = Math.min(NEUTRAL_K, out.maxKelvin)
-  if (out.minKelvin !== undefined) out.minKelvin = Math.max(1000, out.minKelvin)
-  if (out.minKelvin !== undefined && out.maxKelvin !== undefined && out.minKelvin > out.maxKelvin) {
-    delete out.minKelvin
-    delete out.maxKelvin
-  }
-  return out
-}
-
-// Written back whenever the panel changes a knob, so the file stays the single
-// source of truth and hand edits survive a round trip.
-function renderConfig(values) {
-  var v = optionsWithDefaults(values)
-  var poll = (values && isFinite(values.pollIntervalSec)) ? values.pollIntervalSec : 2
-  return [
-    "# omarchy true tone. Managed by the panel, safe to hand edit.",
-    "",
-    "# How far to move toward the room colour, 0 to 1.",
-    "strength = " + v.strength,
-    "",
-    "# Warmest the display may go.",
-    "minKelvin = " + Math.round(v.minKelvin),
-    "",
-    "# Coolest. Above " + NEUTRAL_K + " tints the panel blue.",
-    "maxKelvin = " + Math.round(v.maxKelvin),
-    "",
-    "# Below this many lux, hold rather than sample.",
-    "luxFloor = " + Math.round(v.luxFloor),
-    "",
-    "# Kelvin per tick while ramping.",
-    "maxStepK = " + Math.round(v.maxStepK),
-    "",
-    "# Seconds between sensor reads.",
-    "pollIntervalSec = " + Math.round(poll),
-    ""
-  ].join("\n")
-}
-
-function saveConfigCommand(values) {
-  return ["bash", "-lc",
-    "mkdir -p ~/.config/omarchy && cat > " + configPath() + " <<'TRUETONE_EOF'\n" +
-    renderConfig(values) + "TRUETONE_EOF"]
-}
-
-function temperatureFromOutput(output) {
-  var match = String(output === undefined || output === null ? "" : output).match(/[0-9]+/)
-  return match ? Number(match[0]) : null
-}
+function parseState(text) { return String(text || "").trim() !== "0" }
 
 function describe(reading, targetK) {
   if (!reading) return "sensor unavailable"
-  var parts = [Math.round(reading.cct) + "K room"]
-  parts.push(Math.round(reading.lux) + " lux")
-  if (targetK) parts.push("→ " + targetK + "K display")
+  var parts = [Math.round(reading.cct) + "K room", Math.round(reading.lux) + " lux"]
+  if (targetK) parts.push("display at " + targetK + "K")
   return parts.join(" · ")
 }
 
 if (typeof module !== "undefined") {
   module.exports = {
-    NEUTRAL_K: NEUTRAL_K,
-    IDENTITY_K: IDENTITY_K,
-    DEFAULTS: DEFAULTS,
-    scanCommand: scanCommand,
-    parseScan: parseScan,
-    pickSensor: pickSensor,
-    readCommand: readCommand,
-    parseReading: parseReading,
+    D65_K: D65_K, STRENGTH: STRENGTH, LUX_FLOOR: LUX_FLOOR,
+    MIN_BLUE_GAIN: MIN_BLUE_GAIN, IDENTITY_GAINS: IDENTITY_GAINS,
+    FAST_INTERVAL_SEC: FAST_INTERVAL_SEC, IDLE_INTERVAL_SEC: IDLE_INTERVAL_SEC,
+    scanCommand: scanCommand, parseScan: parseScan, pickSensor: pickSensor,
     hasUsableLight: hasUsableLight,
-    PACING: PACING,
-    isSettled: isSettled,
-    pollIntervalFor: pollIntervalFor,
-    statePath: statePath,
-    loadStateCommand: loadStateCommand,
-    saveStateCommand: saveStateCommand,
-    parseState: parseState,
-    configPath: configPath,
-    loadConfigCommand: loadConfigCommand,
-    parseConfig: parseConfig,
-    renderConfig: renderConfig,
-    saveConfigCommand: saveConfigCommand,
-    adaptTarget: adaptTarget,
-    smooth: smooth,
-    nextStep: nextStep,
-    evaluateOwnership: evaluateOwnership,
-    sanitizeOptions: sanitizeOptions,
-    temperatureFromOutput: temperatureFromOutput,
+    locusXY: locusXY, xyToGains: xyToGains, adaptGains: adaptGains,
+    smoothCct: smoothCct, stepGains: stepGains, isSettled: isSettled,
+    pollIntervalFor: pollIntervalFor, setCommand: setCommand,
+    statePath: statePath, loadStateCommand: loadStateCommand,
+    saveStateCommand: saveStateCommand, parseState: parseState,
     describe: describe
   }
 }

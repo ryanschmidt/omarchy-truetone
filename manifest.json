@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "ryanschmidt.truetone",
   "name": "True Tone",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Ryan Schmidt",
   "license": "MIT",
-  "description": "Matches the display white point to the color of the light in your room, using the ambient color sensor. A True Tone equivalent for Omarchy.",
+  "description": "Automatically adapts the display so colours look consistent in different ambient lighting, using the ambient colour sensor. Independent of Night Light; both can be on.",
   "kinds": [
     "service",
     "bar-widget"
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "True Tone",
-    "description": "Click for live sensor readings, an on/off toggle, and settings.",
+    "description": "On/off switch and the live ambient colour reading.",
     "category": "Display",
     "allowMultiple": false,
     "defaultSection": "right",

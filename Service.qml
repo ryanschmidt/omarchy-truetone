@@ -1,46 +1,22 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 import "TrueToneModel.js" as Model
 
-// Reads the ambient color sensor and moves the display white point to match.
-// Applies through hyprsunset, the same surface Omarchy's own Night Light uses.
+// Matches the display white point to the colour of the room.
 //
-// Two invariants hold the design together, both the product of a review that
-// found real ways to break them:
+// It writes to a wlr-gamma-control ramp through a small resident helper, and
+// never touches hyprsunset's colour transform matrix. That matrix belongs to
+// Omarchy's Night Light, which holds it exclusively, and the compositor
+// composes the two channels at scanout. So the two features stack the way
+// True Tone and Night Shift do on a Mac, neither aware of the other, and
+// Night Light's own toggle keeps working because nothing here disturbs it.
 //
-//   OWNERSHIP. We only write the temperature while the display shows what we
-//   last put there, or while it sits at neutral and is therefore free. Anything
-//   else means Night Light or the user owns it and we stand down. Ownership is
-//   re-established by a probe before any write, never assumed.
-//
-//   ONE OPERATION IN FLIGHT. A probe, a sample cycle, or an apply, never two.
-//   Sensor callbacks arrive asynchronously and used to be able to land after a
-//   disable, or pair a fresh reading with a stale one.
-//
-// Cost discipline, because this runs forever on a laptop: sysfs is read in
-// process via FileView with no fork, there is no shell in the steady state,
-// and polling backs off from 2s to 20s once the room stops changing.
+// There are no settings, the same as on a Mac. It is on or off.
 Item {
   id: root
 
   property var shell: null
-
-  // ---- configuration -------------------------------------------------------
-  property real strength: 0.5
-  property int minKelvin: 3800
-  property int maxKelvin: Model.NEUTRAL_K
-  property int luxFloor: 3
-  property int maxStepK: 150
-  property int pollIntervalSec: 2
-  property int idleIntervalSec: 20
-
-  readonly property var opts: ({
-    strength: root.strength,
-    minKelvin: root.minKelvin,
-    maxKelvin: root.maxKelvin,
-    luxFloor: root.luxFloor,
-    maxStepK: root.maxStepK
-  })
 
   // ---- state ---------------------------------------------------------------
   property bool enabled: true
@@ -50,33 +26,19 @@ Item {
   property bool sensorHasColor: false
   property string unavailableReason: ""
 
-  property var reading: null
+  property bool helperReady: false
+  property string helperError: ""
+  property int outputCount: 0
+
+  property var reading: null          // { cct, lux, x, y }
   property var smoothedCct: null
   property var previousCct: null
+  property var targetGains: null
+  property var appliedGains: null
   property var targetK: null
-  property var appliedK: null      // last CONFIRMED display temperature
-  property var lastSetK: null      // last value we successfully wrote
-  property bool yielded: false
-  property bool transportOk: true  // is hyprctl answering at all
-  // Set only by an explicit user action. Startup stays conservative and yields
-  // to whoever already holds a warm display; a deliberate toggle-on is the
-  // user saying "I want True Tone now", which outranks that caution and is
-  // also the only way out if something else parked the display warm.
-  property bool adoptOnNextProbe: false
-  // Releasing the display has to be decided against a FRESH probe. The
-  // `yielded` flag can be up to one idle poll stale, and acting on a stale
-  // "we own it" is how disabling True Tone switched off someone's Night Light.
-  property bool releaseOnNextProbe: false
-
   property bool settled: false
 
-  // Exactly one of these may be true at a time.
-  property bool probePending: false
   property bool samplePending: false
-  property bool applyPending: false
-  property bool probeHandled: false
-
-  // Sample slots, filled by the FileView callbacks for the current cycle only.
   property var sampleCct: null
   property var sampleLux: null
   property var sampleX: null
@@ -85,18 +47,19 @@ Item {
   property real cctScale: 0.001
   property real luxScale: 0.001
   property real xyScale: 0.001
+  property int scalesLoaded: 0
 
-  readonly property bool busy: probePending || samplePending || applyPending
-  readonly property bool active: enabled && ready && sensorHasColor && !yielded && transportOk
+  readonly property bool supported: ready && sensorHasColor && helperReady
+  readonly property bool active: supported && enabled
 
   readonly property string statusText: {
     if (!ready) return "starting"
     if (!sensorHasColor) return unavailableReason
+    if (helperError !== "") return helperError
+    if (!helperReady) return "starting"
     if (!enabled) return "off"
-    if (!transportOk) return "hyprsunset unavailable"
-    if (yielded) return "paused (Night Light)"
     if (!reading) return "no reading"
-    if (!Model.hasUsableLight(reading.lux, opts)) return "too dark to sample"
+    if (!Model.hasUsableLight(reading.lux)) return "too dark to sample"
     return Model.describe(reading, targetK)
   }
 
@@ -105,163 +68,42 @@ Item {
   function setEnabled(value) {
     if (root.enabled === value) return
     root.enabled = value
+    persist.command = Model.saveStateCommand(value)
+    persist.running = true
 
-    saveState()
-
-    // Abandon anything in flight so a late callback cannot act for the state
-    // we just left.
-    abandonInFlight()
+    root.samplePending = false
 
     if (!value) {
-      // Ask the display who owns it before handing anything back.
-      root.releaseOnNextProbe = true
-      startProbe()
+      sendGains(null)
+      root.appliedGains = Model.IDENTITY_GAINS
+      root.targetGains = null
+      root.targetK = null
     } else {
-      root.lastSetK = null
       root.smoothedCct = null
       root.previousCct = null
       root.settled = false
-      root.adoptOnNextProbe = true
-      root.yielded = false
       tick()
     }
   }
 
   function toggle() { setEnabled(!enabled) }
 
-  // Explicitly claim the display back. Startup deliberately refuses to seize a
-  // warm display it did not set, so this is the way out when something else
-  // parked it warm and never released.
-  function adopt() {
-    root.adoptOnNextProbe = true
-    root.yielded = false
-    root.settled = false
-    root.tick()
-  }
-
-  function abandonInFlight() {
-    root.probePending = false
-    root.samplePending = false
-    root.probeHandled = true      // ignore any probe result still coming
-    root.sampleCct = null
-    root.sampleLux = null
-  }
-
-  // ---- settings ------------------------------------------------------------
-
-  function setSetting(key, value) {
-    if (!isFinite(value)) return
-    if (key === "strength") root.strength = Math.max(0, Math.min(1, value))
-    else if (key === "minKelvin") root.minKelvin = Math.round(Math.min(value, root.maxKelvin))
-    else if (key === "maxKelvin") root.maxKelvin = Math.round(Math.max(Math.min(value, Model.NEUTRAL_K), root.minKelvin))
-    else if (key === "luxFloor") root.luxFloor = Math.round(value)
-    else if (key === "maxStepK") root.maxStepK = Math.max(1, Math.round(value))
-    else if (key === "pollIntervalSec") root.pollIntervalSec = Math.max(1, Math.round(value))
-    else return
-
-    if (root.reading) {
-      root.targetK = Model.adaptTarget(root.smoothedCct !== null ? root.smoothedCct : root.reading.cct, opts)
-    }
-    root.settled = false
-    saveDebounce.restart()
-  }
-
-  function resetSettings() {
-    root.strength = Model.DEFAULTS.strength
-    root.minKelvin = Model.DEFAULTS.minKelvin
-    root.maxKelvin = Model.NEUTRAL_K
-    root.luxFloor = Model.DEFAULTS.luxFloor
-    root.maxStepK = 150
-    root.pollIntervalSec = 2
-    if (root.reading) root.targetK = Model.adaptTarget(root.reading.cct, opts)
-    root.settled = false
-    saveDebounce.restart()
-  }
-
   // ---- the loop ------------------------------------------------------------
 
   function runnable() {
-    return root.ready && root.sensorBound && root.sensorHasColor && root.enabled
+    return root.ready && root.sensorBound && root.sensorHasColor
+      && root.helperReady && root.enabled
   }
 
   function tick() {
-    if (!runnable() || root.busy) return
-
-    // Always re-establish ownership before anything that could write. An
-    // earlier version skipped the probe on most settled ticks to save a
-    // subprocess; measured, hyprctl costs 2.6ms, and the skip bought nothing
-    // while leaving up to 60s in which Night Light could take the display
-    // without us noticing. Probing every tick is cheaper than being wrong.
-    startProbe()
-  }
-
-  function startProbe() {
-    root.probePending = true
-    root.probeHandled = false
-    probeProcess.running = true
-  }
-
-  // Called from stdout and from onExited; the first one wins.
-  function onProbeResult(temp) {
-    if (root.probeHandled) return
-    root.probeHandled = true
-    root.probePending = false
-
-    if (temp === null || temp === undefined) {
-      // hyprctl did not answer. Unknown is not neutral: guessing neutral here
-      // used to clear a legitimate yield and then write over Night Light.
-      root.transportOk = false
-      root.settled = false
-      return
-    }
-
-    root.transportOk = true
-    root.appliedK = temp
-
-    var own = Model.evaluateOwnership(temp, root.lastSetK)
-
-    // Disable path: restore neutral only if the display is still showing what
-    // we put there. If something else took it meanwhile, leave it alone.
-    if (root.releaseOnNextProbe) {
-      root.releaseOnNextProbe = false
-      root.yielded = false
-      if (own.owned && !own.atNeutral) applyTemperature(Model.NEUTRAL_K)
-      return
-    }
-
-    if (root.adoptOnNextProbe) {
-      root.adoptOnNextProbe = false
-      root.yielded = false
-      // Claim the CURRENT value as ours. Clearing it instead left the next
-      // probe with nothing to recognise, so the adopt lasted exactly one tick
-      // and then re-yielded.
-      root.lastSetK = temp
-    } else {
-      root.yielded = own.shouldYield
-      if (root.yielded) {
-        root.settled = false
-        return
-      }
-    }
-    // Taking a free display: forget any stale value so the first write is a
-    // clean jump rather than a ramp from something we no longer hold.
-    if (!own.owned && own.atNeutral) root.lastSetK = null
-
-    if (!root.enabled) return
-    startSample()
-  }
-
-  // ---- sampling ------------------------------------------------------------
-
-  // One cycle at a time. reload() is asynchronous with no ordering guarantee,
-  // so the cycle completes only when both required files have reported, rather
-  // than assuming the last reload issued is the last to land.
-  function startSample() {
-    if (!runnable()) return
+    if (!runnable() || root.samplePending) return
     root.samplePending = true
     root.sampleCct = null
     root.sampleLux = null
     sampleWatchdog.restart()
+    // reload() is asynchronous with no ordering guarantee, so the cycle
+    // completes on the arrival of both required values, not on the last
+    // reload issued.
     luxFile.reload()
     chromaXFile.reload()
     chromaYFile.reload()
@@ -269,67 +111,81 @@ Item {
   }
 
   function noteSample(which, value) {
-    if (!root.samplePending) return   // stale arrival from an abandoned cycle
+    // Chromaticity is advisory and frequently lands after cct and lux have
+    // already closed the cycle. Dropping it as "late" silently disabled the
+    // off-locus correction, which is the entire reason for reading a colour
+    // sensor rather than a lux one. Accept it whenever it arrives.
+    if (which === "x") { root.sampleX = value; return }
+    if (which === "y") { root.sampleY = value; return }
+
+    if (!root.samplePending) return
     if (which === "cct") root.sampleCct = value
     else if (which === "lux") root.sampleLux = value
-    else if (which === "x") root.sampleX = value
-    else if (which === "y") root.sampleY = value
-
     if (root.sampleCct !== null && root.sampleLux !== null) completeSample()
   }
 
   function completeSample() {
     root.samplePending = false
     sampleWatchdog.stop()
-
-    // The state may have changed while the reads were in flight.
-    if (!runnable() || root.yielded || !root.transportOk) return
+    if (!runnable()) return
 
     var cct = root.sampleCct * root.cctScale
     var lux = root.sampleLux * root.luxScale
     if (!isFinite(cct) || !isFinite(lux) || cct <= 0) return
 
-    root.reading = {
-      cct: cct,
-      lux: lux,
-      x: root.sampleX !== null ? root.sampleX * root.xyScale : null,
-      y: root.sampleY !== null ? root.sampleY * root.xyScale : null
-    }
+    var x = (root.sampleX !== null && isFinite(root.sampleX)) ? root.sampleX * root.xyScale : null
+    var y = (root.sampleY !== null && isFinite(root.sampleY)) ? root.sampleY * root.xyScale : null
+    root.reading = { cct: cct, lux: lux, x: x, y: y }
 
-    if (!Model.hasUsableLight(lux, opts)) {
+    // Below the floor the colour channel is noise. Hold the last good value.
+    if (!Model.hasUsableLight(lux)) {
       root.previousCct = cct
       root.settled = true
       return
     }
 
-    root.smoothedCct = Model.smooth(root.smoothedCct, cct, opts)
-    root.targetK = Model.adaptTarget(root.smoothedCct, opts)
+    root.smoothedCct = Model.smoothCct(root.smoothedCct, cct)
+    var goal = Model.adaptGains(root.smoothedCct, x, y)
+    if (goal) {
+      root.targetGains = { r: goal.r, g: goal.g, b: goal.b }
+      root.targetK = goal.targetK
+    }
 
-    var step = Model.nextStep(root.appliedK, root.targetK, opts)
-    if (step !== null) applyTemperature(step)
+    var step = Model.stepGains(root.appliedGains, root.targetGains)
+    if (step) {
+      root.appliedGains = step
+      sendGains(step)
+    }
 
     root.settled = Model.isSettled({
-      appliedK: root.appliedK,
-      targetK: root.targetK,
+      appliedGains: root.appliedGains,
+      targetGains: root.targetGains,
       cct: cct,
       previousCct: root.previousCct
-    }, opts)
+    })
     root.previousCct = cct
   }
 
-  // ---- applying ------------------------------------------------------------
+  // The helper watches this file with inotify. Written through FileView so a
+  // ramp step costs no subprocess; atomicWrites renames into place, which is
+  // why the helper watches the directory for IN_MOVED_TO as well.
+  readonly property string gainsPath: {
+    var home = Quickshell.env("HOME") || ""
+    return home + "/.local/state/omarchy-truetone/gains"
+  }
 
-  // Direct argv, no shell. lastSetK and appliedK are only advanced once the
-  // command has actually succeeded; recording them optimistically meant a
-  // probe landing mid-apply saw the old value and called it a takeover.
-  property var pendingApplyK: null
+  function sendGains(gains) {
+    gainsFile.setText(gains
+      ? gains.r.toFixed(3) + " " + gains.g.toFixed(3) + " " + gains.b.toFixed(3) + "\n"
+      : "1.000 1.000 1.000\n")
+  }
 
-  function applyTemperature(temp) {
-    if (root.applyPending) return
-    root.pendingApplyK = Math.round(temp)
-    root.applyPending = true
-    applyProcess.command = ["hyprctl", "hyprsunset", "temperature", String(root.pendingApplyK)]
-    applyProcess.running = true
+  FileView {
+    id: gainsFile
+    path: root.gainsPath
+    atomicWrites: true
+    watchChanges: false
+    printErrors: false
   }
 
   // ---- sensor files --------------------------------------------------------
@@ -369,15 +225,28 @@ Item {
     onLoadFailed: root.markScaleLoaded()
   }
 
-  property int scalesLoaded: 0
-
-  // Scales must be known before a reading can be converted, so the loop does
-  // not start until all three have reported one way or the other.
+  // Scales must be known before a reading can be converted.
   function markScaleLoaded() {
     root.scalesLoaded++
     if (root.scalesLoaded >= 3 && !root.sensorBound) {
       root.sensorBound = true
-      ensureProcess.running = true
+      prepare.running = true   // builds if needed, then starts the helper
+    }
+  }
+
+  // Prepare, then start. The helper is compiled on first run so that
+  // `omarchy plugin add` is genuinely all a user has to do; gcc and
+  // wayland-scanner are present on any Hyprland system.
+  Process {
+    id: prepare
+    command: ["bash", "-lc",
+      "mkdir -p ~/.local/state/omarchy-truetone && " +
+      "cd " + JSON.stringify(root.pluginDir) + " && " +
+      "[ -x ./truetone-gamma ] || ./build.sh"]
+    stderr: SplitParser { onRead: function (l) { console.warn("truetone build: " + l) } }
+    onExited: function (code) {
+      if (code !== 0) root.helperError = "could not build the gamma helper"
+      else root.startHelper()
     }
   }
 
@@ -391,7 +260,45 @@ Item {
     chromaYFile.path = path + "/in_chromaticity_y_raw"
   }
 
-  // ---- processes -----------------------------------------------------------
+  // ---- the gamma helper ----------------------------------------------------
+
+  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace("file://", "").replace(/\/$/, "")
+  readonly property string helperPath: root.pluginDir + "/truetone-gamma"
+
+  function startHelper() {
+    helper.command = [root.helperPath, root.gainsPath]
+    helper.running = true
+  }
+
+  // A resident client, because the compositor drops the ramp the instant its
+  // client disconnects. On exit the original ramps are restored, which is the
+  // behaviour we want on shutdown or a crash.
+  Process {
+    id: helper
+    stdout: SplitParser {
+      onRead: function (line) {
+        var s = String(line).trim()
+        if (s.indexOf("READY") === 0) {
+          root.outputCount = parseInt(s.split(" ")[1]) || 0
+          root.helperReady = true
+          root.helperError = ""
+          if (root.enabled) root.tick()
+        }
+      }
+    }
+    stderr: SplitParser {
+      onRead: function (line) { console.warn("truetone-gamma: " + line) }
+    }
+    onExited: function (code) {
+      root.helperReady = false
+      root.appliedGains = null
+      if (code !== 0) {
+        root.helperError = "gamma helper failed, run build.sh"
+      }
+    }
+  }
+
+  // ---- startup -------------------------------------------------------------
 
   Process {
     id: scanProcess
@@ -404,7 +311,7 @@ Item {
           root.unavailableReason = "no ambient light sensor"
         } else if (!picked.hasColortemp) {
           root.sensorPath = picked.path
-          root.unavailableReason = "sensor has no color channel"
+          root.unavailableReason = "sensor reports brightness only, not colour"
         } else {
           root.sensorPath = picked.path
           root.sensorHasColor = true
@@ -416,96 +323,19 @@ Item {
   }
 
   Process {
-    id: ensureProcess
-    command: ["bash", "-lc",
-      "pgrep -x hyprsunset >/dev/null || { setsid uwsm-app -- hyprsunset >/dev/null 2>&1 & sleep 1; }"]
-    onExited: root.tick()
-  }
-
-  Process {
-    id: probeProcess
-    command: ["hyprctl", "hyprsunset", "temperature"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.onProbeResult(Model.temperatureFromOutput(text))
-    }
-    onExited: function (code) {
-      if (code !== 0) root.onProbeResult(null)
-      else if (root.probePending) root.onProbeResult(null)  // exited clean but said nothing
-    }
-  }
-
-  Process {
-    id: applyProcess
-    onExited: function (code) {
-      root.applyPending = false
-      if (code === 0 && root.pendingApplyK !== null) {
-        root.lastSetK = root.pendingApplyK
-        root.appliedK = root.pendingApplyK
-        root.transportOk = true
-        root.saveState()
-      } else if (code !== 0) {
-        // The display did not move. Do not pretend it did.
-        root.transportOk = false
-        root.settled = false
-      }
-      root.pendingApplyK = null
-    }
-  }
-
-  Process { id: persist }
-  Process { id: saveProcess }
-
-  // Debounced so a ramp does not write the state file once per 150K step.
-  function saveState() { stateDebounce.restart() }
-
-  Timer {
-    id: stateDebounce
-    interval: 1500
-    repeat: false
-    onTriggered: {
-      persist.command = Model.saveStateCommand(root.enabled, root.lastSetK)
-      persist.running = true
-    }
-  }
-
-  Process {
     id: restore
     command: Model.loadStateCommand()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var st = Model.parseState(text)
-        root.enabled = st.enabled
-        // Remembering what we last wrote is what lets the ownership check
-        // recognise our own leftover value after a shell restart instead of
-        // treating it as somebody else's and parking.
-        root.lastSetK = st.lastSetK
-      }
-    }
-  }
-
-  Process {
-    id: loadConfig
-    command: Model.loadConfigCommand()
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var c = Model.parseConfig(text)
-        if (c.strength !== undefined) root.strength = c.strength
-        if (c.minKelvin !== undefined) root.minKelvin = c.minKelvin
-        if (c.maxKelvin !== undefined) root.maxKelvin = c.maxKelvin
-        if (c.luxFloor !== undefined) root.luxFloor = c.luxFloor
-        if (c.maxStepK !== undefined) root.maxStepK = c.maxStepK
-        if (c.pollIntervalSec !== undefined) root.pollIntervalSec = c.pollIntervalSec
-        // Only start the sensor scan once the persisted enable state and the
-        // config are in hand, so the first tick acts on the real settings.
+        root.enabled = Model.parseState(text)
         scanProcess.running = true
       }
     }
   }
 
-  // If a sample cycle never completes, drop it rather than wedging the loop.
+  Process { id: persist }
+
   Timer {
     id: sampleWatchdog
     interval: 5000
@@ -514,34 +344,14 @@ Item {
   }
 
   Timer {
-    id: saveDebounce
-    interval: 600
-    repeat: false
-    onTriggered: {
-      saveProcess.command = Model.saveConfigCommand({
-        strength: root.strength,
-        minKelvin: root.minKelvin,
-        maxKelvin: root.maxKelvin,
-        luxFloor: root.luxFloor,
-        maxStepK: root.maxStepK,
-        pollIntervalSec: root.pollIntervalSec
-      })
-      saveProcess.running = true
-    }
-  }
-
-  Timer {
     id: loop
-    interval: Model.pollIntervalFor(root.settled, root.pollIntervalSec, root.idleIntervalSec) * 1000
-    running: root.ready && root.sensorBound && root.sensorHasColor && root.enabled
+    interval: Model.pollIntervalFor(root.settled) * 1000
+    running: root.runnable()
     repeat: true
     onTriggered: root.tick()
   }
 
-  Component.onCompleted: {
-    restore.running = true
-    loadConfig.running = true   // chains into scanProcess
-  }
+  Component.onCompleted: restore.running = true
 
   IpcHandler {
     target: "truetone"
@@ -550,17 +360,20 @@ Item {
       return JSON.stringify({
         enabled: root.enabled,
         active: root.active,
-        yielded: root.yielded,
-        transportOk: root.transportOk,
+        supported: root.supported,
         settled: root.settled,
-        pollSeconds: Model.pollIntervalFor(root.settled, root.pollIntervalSec, root.idleIntervalSec),
+        pollSeconds: Model.pollIntervalFor(root.settled),
         sensor: root.sensorPath,
         hasColorChannel: root.sensorHasColor,
-        reason: root.unavailableReason,
+        helperReady: root.helperReady,
+        outputs: root.outputCount,
+        reason: root.unavailableReason || root.helperError,
         roomKelvin: root.reading ? Math.round(root.reading.cct) : null,
         lux: root.reading ? Math.round(root.reading.lux) : null,
+        chromaticity: root.reading && root.reading.x !== null
+          ? { x: root.reading.x, y: root.reading.y } : null,
         targetKelvin: root.targetK,
-        appliedKelvin: root.appliedK,
+        gains: root.appliedGains,
         text: root.statusText
       })
     }
@@ -569,8 +382,5 @@ Item {
     function disable(): string { root.setEnabled(false); return "disabled" }
     function toggle(): string { root.toggle(); return root.enabled ? "enabled" : "disabled" }
     function refresh(): void { root.settled = false; root.tick() }
-
-    // Explicit "take the display back" without cycling the enable flag.
-    function adopt(): string { root.adopt(); return "adopting" }
   }
 }
