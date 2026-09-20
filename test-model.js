@@ -149,25 +149,85 @@ test("ramp converges and then stops", function () {
   assert.ok(Math.abs(cur - target) <= 25, "settled at " + cur)
 })
 
-console.log("\nyielding to Night Light")
+console.log("\nownership (regression: codex review findings 2 and 5)")
 
-test("detects an external temperature change", function () {
-  assert.strictEqual(M.externallyChanged(4000, 5200), true)
+test("yields when Night Light already owns the display at startup", function () {
+  // lastSetK is null because we have set nothing yet. The old test returned
+  // "nothing changed" here and stamped over Night Light.
+  var o = M.evaluateOwnership(4000, null)
+  assert.strictEqual(o.shouldYield, true)
+  assert.strictEqual(o.owned, false)
 })
 
-test("tolerates our own value coming back", function () {
-  assert.strictEqual(M.externallyChanged(5200, 5200), false)
-  assert.strictEqual(M.externallyChanged(5210, 5200), false)
+test("adopts a free display at neutral on startup", function () {
+  var o = M.evaluateOwnership(6500, null)
+  assert.strictEqual(o.shouldYield, false)
+  assert.strictEqual(o.atNeutral, true)
 })
 
-test("does not claim a change before we have set anything", function () {
-  assert.strictEqual(M.externallyChanged(4000, null), false)
+test("keeps ownership when the display shows what we set", function () {
+  var o = M.evaluateOwnership(4250, 4250)
+  assert.strictEqual(o.owned, true)
+  assert.strictEqual(o.shouldYield, false)
+})
+
+test("yields when something else warms the display", function () {
+  var o = M.evaluateOwnership(4000, 5200)
+  assert.strictEqual(o.owned, false)
+  assert.strictEqual(o.shouldYield, true)
+})
+
+test("resumes after Night Light returns to neutral, even at a value we once set", function () {
+  // The stuck-yielded case. We last set 6500, Night Light took it to 4000,
+  // then released back to 6500.
+  var o = M.evaluateOwnership(6500, 6500)
+  assert.strictEqual(o.shouldYield, false)
+  assert.strictEqual(o.atNeutral, true)
+})
+
+test("treats an unknown temperature as not ours", function () {
+  var o = M.evaluateOwnership(null, 4250)
+  assert.strictEqual(o.shouldYield, true)
 })
 
 test("parses hyprctl output the way Omarchy's nightlight does", function () {
   assert.strictEqual(M.temperatureFromOutput("6500"), 6500)
   assert.strictEqual(M.temperatureFromOutput("temperature: 4000\n"), 4000)
   assert.strictEqual(M.temperatureFromOutput(""), null)
+})
+
+console.log("\nconfig sanitising (regression: codex review finding 8)")
+
+test("a lone minKelvin above neutral cannot push the target above neutral", function () {
+  // Previously produced a 9000K target because the pairwise range check only
+  // ran when BOTH bounds were supplied.
+  assert.strictEqual(M.adaptTarget(2000, M.parseConfig("minKelvin=9000")), M.NEUTRAL_K)
+})
+
+test("a negative step still ramps toward the target", function () {
+  var step = M.nextStep(6500, 4250, M.parseConfig("maxStepK=-150"))
+  assert.ok(step < 6500, "moved the wrong way: " + step)
+})
+
+test("a zero step still converges", function () {
+  var cur = 6500, ticks = 0
+  while (ticks < 500) {
+    var n = M.nextStep(cur, 4250, { maxStepK: 0 })
+    if (n === null) break
+    cur = n; ticks++
+  }
+  assert.ok(ticks < 500, "never converged")
+})
+
+test("effective options are clamped, not just supplied ones", function () {
+  var o = M.sanitizeOptions({ strength: 9, minKelvin: 99999, maxKelvin: 99999, maxStepK: -5, emaAlpha: 0, deadbandK: -1, luxFloor: -4 })
+  assert.strictEqual(o.strength, 1)
+  assert.strictEqual(o.maxKelvin, M.NEUTRAL_K)
+  assert.ok(o.minKelvin <= o.maxKelvin)
+  assert.ok(o.maxStepK >= 1)
+  assert.ok(o.emaAlpha > 0)
+  assert.ok(o.deadbandK >= 0)
+  assert.ok(o.luxFloor >= 0)
 })
 
 console.log("\npacing")
@@ -194,12 +254,6 @@ test("backs off the poll once settled", function () {
 
 test("never backs off below the configured fast interval", function () {
   assert.strictEqual(M.pollIntervalFor(true, 30, 20), 30)
-})
-
-test("probes hyprctl every tick while moving, sparsely when settled", function () {
-  assert.strictEqual(M.shouldProbe(0, false), true)
-  assert.strictEqual(M.shouldProbe(0, true), false)
-  assert.strictEqual(M.shouldProbe(3, true), true)
 })
 
 console.log("\nconfig")
@@ -250,6 +304,40 @@ test("rendered config carries no shell metacharacters that would break the hered
   var text = M.renderConfig({ strength: 0.5 })
   assert.strictEqual(text.indexOf("TRUETONE_EOF"), -1)
   assert.strictEqual(/[`$\\]/.test(text), false)
+})
+
+console.log("\npersisted state")
+
+test("round trips enabled and the last temperature we wrote", function () {
+  var cmd = M.saveStateCommand(true, 4270)
+  var body = cmd[2].split("TRUETONE_STATE_EOF")[1]
+  var back = M.parseState(body)
+  assert.strictEqual(back.enabled, true)
+  assert.strictEqual(back.lastSetK, 4270)
+})
+
+test("a missing state file means enabled with no remembered temperature", function () {
+  var s = M.parseState("")
+  assert.strictEqual(s.enabled, true)
+  assert.strictEqual(s.lastSetK, null)
+})
+
+test("remembering our own value survives a restart without yielding", function () {
+  // The regression: after a shell restart the display still shows our 4270K.
+  // Without the remembered value this reads as somebody else's and parks.
+  var remembered = M.parseState("enabled=1\nlastSet=4270").lastSetK
+  assert.strictEqual(M.evaluateOwnership(4270, remembered).shouldYield, false)
+  assert.strictEqual(M.evaluateOwnership(4270, null).shouldYield, true)
+})
+
+test("a remembered value does not stop us yielding to Night Light", function () {
+  var remembered = M.parseState("enabled=1\nlastSet=4270").lastSetK
+  assert.strictEqual(M.evaluateOwnership(4000, remembered).shouldYield, true)
+})
+
+test("garbage state degrades to the safe default", function () {
+  assert.strictEqual(M.parseState("lastSet=banana").lastSetK, null)
+  assert.strictEqual(M.parseState("enabled=0").enabled, false)
 })
 
 console.log("\nend to end")

@@ -127,11 +127,37 @@ function parseReading(text) {
 // Adaptation
 // ---------------------------------------------------------------------------
 
+// Clamp the EFFECTIVE options, after merging, not just the ones that arrived
+// from the config file. Validating only what the file supplied let a lone
+// `minKelvin = 9000` sail past the pairwise check and produce a 9000K target,
+// and a negative `maxStepK` ramp the wrong way.
+function sanitizeOptions(o) {
+  o.strength = clampNumber(o.strength, 0, 1, DEFAULTS.strength)
+  o.maxKelvin = clampNumber(o.maxKelvin, 1000, NEUTRAL_K, NEUTRAL_K)
+  o.minKelvin = clampNumber(o.minKelvin, 1000, NEUTRAL_K, DEFAULTS.minKelvin)
+  if (o.minKelvin > o.maxKelvin) o.minKelvin = o.maxKelvin
+  o.luxFloor = clampNumber(o.luxFloor, 0, 100000, DEFAULTS.luxFloor)
+  o.emaAlpha = clampNumber(o.emaAlpha, 0.01, 1, DEFAULTS.emaAlpha)
+  o.deadbandK = clampNumber(o.deadbandK, 0, 5000, DEFAULTS.deadbandK)
+  // A zero or negative step never converges, or converges away from target.
+  // Clamping those to 1 would be safe but glacial, so treat them as invalid
+  // and fall back to the default instead.
+  var step = Number(o.maxStepK)
+  o.maxStepK = (isFinite(step) && step >= 1) ? Math.min(step, 5000) : DEFAULTS.maxStepK
+  return o
+}
+
+function clampNumber(value, low, high, fallback) {
+  var v = Number(value)
+  if (!isFinite(v)) return fallback
+  return Math.max(low, Math.min(high, v))
+}
+
 function optionsWithDefaults(opts) {
   var o = {}
   for (var k in DEFAULTS) o[k] = DEFAULTS[k]
   if (opts) for (var j in opts) if (opts[j] !== undefined && opts[j] !== null) o[j] = opts[j]
-  return o
+  return sanitizeOptions(o)
 }
 
 function hasUsableLight(lux, opts) {
@@ -166,13 +192,27 @@ function nextStep(currentK, targetK, opts) {
   return Math.round(currentK + step)
 }
 
-// We only own the display while nothing else has touched it. If the applied
-// temperature is not the one we last set, Night Light or the user took over,
-// and we yield rather than fight them for the CTM.
-function externallyChanged(appliedK, lastSetK, tolerance) {
-  if (lastSetK === null || lastSetK === undefined) return false
-  if (appliedK === null || appliedK === undefined) return false
-  return Math.abs(appliedK - lastSetK) > (tolerance === undefined ? 60 : tolerance)
+// Who owns the colour transform right now.
+//
+// Replaces an earlier "did it change from what we set" test, which had two
+// holes. Before we had set anything, `lastSetK` was null and the test returned
+// false, so starting up while Night Light already held 4000K read as "nothing
+// is happening" and we stamped over it. And once Night Light returned the
+// display to a value we had previously set ourselves, the test also returned
+// false, so the resume branch never ran and we stayed paused forever.
+//
+// The rule is positional, not historical: we own the display when it shows
+// what we last put there. If it does not, whoever warmed it owns it, unless it
+// is sitting at neutral, in which case the field is free and we may take it.
+function evaluateOwnership(appliedK, lastSetK, tolerance) {
+  var t = (tolerance === undefined) ? 60 : tolerance
+  if (appliedK === null || appliedK === undefined) {
+    return { owned: false, atNeutral: false, shouldYield: true }
+  }
+  var atNeutral = Math.abs(appliedK - NEUTRAL_K) <= t
+  var owned = (lastSetK !== null && lastSetK !== undefined)
+    && Math.abs(appliedK - lastSetK) <= t
+  return { owned: owned, atNeutral: atNeutral, shouldYield: !owned && !atNeutral }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,12 +247,44 @@ function pollIntervalFor(settled, fastSec, idleSec) {
   return settled ? Math.max(fast, idle) : fast
 }
 
-// The hyprctl probe is the only remaining subprocess in the steady state, and
-// it exists solely to notice Night Light taking over. Once settled, checking
-// that every tick is waste; a slower cadence still catches it promptly.
-function shouldProbe(ticksSinceProbe, settled) {
-  if (!settled) return true
-  return ticksSinceProbe >= 3
+// ---------------------------------------------------------------------------
+// Persisted runtime state
+// ---------------------------------------------------------------------------
+
+// The enable flag plus the last temperature we wrote. The temperature matters
+// across a shell restart: without it, our own leftover warm value looks like
+// somebody else's and the ownership check parks the plugin as "paused".
+function statePath() {
+  return "~/.local/state/omarchy-truetone/state"
+}
+
+function loadStateCommand() {
+  return ["bash", "-lc", "cat " + statePath() + " 2>/dev/null || true"]
+}
+
+function saveStateCommand(enabled, lastSetK) {
+  var body = "enabled=" + (enabled ? "1" : "0") + "\n"
+    + "lastSet=" + (isFinite(lastSetK) && lastSetK !== null ? Math.round(lastSetK) : "") + "\n"
+  return ["bash", "-lc",
+    "mkdir -p ~/.local/state/omarchy-truetone && cat > " + statePath() + " <<'TRUETONE_STATE_EOF'\n"
+    + body + "TRUETONE_STATE_EOF"]
+}
+
+function parseState(text) {
+  var out = { enabled: true, lastSetK: null }
+  var lines = String(text || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var eq = lines[i].indexOf("=")
+    if (eq <= 0) continue
+    var k = lines[i].slice(0, eq).trim()
+    var v = lines[i].slice(eq + 1).trim()
+    if (k === "enabled") out.enabled = v !== "0"
+    else if (k === "lastSet") {
+      var n = parseFloat(v)
+      out.lastSetK = (isFinite(n) && n > 0) ? Math.round(n) : null
+    }
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +392,10 @@ if (typeof module !== "undefined") {
     PACING: PACING,
     isSettled: isSettled,
     pollIntervalFor: pollIntervalFor,
-    shouldProbe: shouldProbe,
+    statePath: statePath,
+    loadStateCommand: loadStateCommand,
+    saveStateCommand: saveStateCommand,
+    parseState: parseState,
     configPath: configPath,
     loadConfigCommand: loadConfigCommand,
     parseConfig: parseConfig,
@@ -329,7 +404,8 @@ if (typeof module !== "undefined") {
     adaptTarget: adaptTarget,
     smooth: smooth,
     nextStep: nextStep,
-    externallyChanged: externallyChanged,
+    evaluateOwnership: evaluateOwnership,
+    sanitizeOptions: sanitizeOptions,
     temperatureFromOutput: temperatureFromOutput,
     describe: describe
   }

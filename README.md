@@ -86,13 +86,16 @@ This runs forever on a laptop, so it is built not to cost anything.
 - **sysfs is read in process**, through Quickshell's `FileView`. No subprocess, no
   fork, microseconds per read.
 - **No shell in the steady state.** A `bash -lc` spawn costs roughly 20 ms of CPU,
-  mostly sourcing your login profile. The only shell this plugin runs is one sensor
-  scan at startup.
+  mostly sourcing your login profile. Shells run only at startup (sensor scan,
+  config load, state restore, and starting hyprsunset if it is not up) and when
+  settings or the enable state are written.
 - **Polling backs off.** Room lighting changes over minutes, so a fixed fast poll
   spends its whole budget confirming that nothing happened. It samples every 2 s
-  while something is moving and every 20 s once settled, waking immediately when
-  the reading shifts.
-- **hyprctl is only called when the temperature actually needs to move.**
+  while something is moving and every 20 s once settled. A change is picked up on
+  the next poll, so up to 20 s later, not instantly.
+- **One `hyprctl` probe per tick**, measured at 2.6 ms. An earlier version skipped
+  most of them to save subprocesses; that bought nothing measurable and left a
+  window in which Night Light could take the display unnoticed.
 
 Measured on a Dell XPS 14, settled: the entire `omarchy-shell` process, bar and
 clock and notifications included, uses **0.10% of one core**.
@@ -127,6 +130,35 @@ exposed in the file; raise `pollIntervalSec` if you want the active cadence slow
 Values are clamped on load, so a typo degrades rather than breaking your display.
 Restart the shell to apply.
 
+## Sharing the display with Night Light
+
+Both this and Omarchy's Night Light drive the same hyprsunset temperature. There is
+no lock, so ownership is decided by observation: True Tone writes only while the
+display shows what it last put there, or while it sits at neutral and is free.
+Anything else means someone took it and True Tone stands down.
+
+```bash
+omarchy-shell truetone status    # includes yielded / active
+omarchy-shell truetone adopt     # take the display back explicitly
+```
+
+Verified behaviour: with True Tone settled, enabling Night Light makes it yield and
+hold at 4000 K indefinitely without fighting, and disabling Night Light makes it
+resume. Disabling True Tone while Night Light owns the display leaves Night Light
+alone rather than resetting to neutral.
+
+**Two limits worth knowing.**
+
+Ownership is re-checked on the poll, so while True Tone is actively ramping (about
+30 s after a lighting change) it writes every 2 s and can win a race against a
+Night Light toggle made in that window. Settled, which is almost all the time, it
+yields correctly.
+
+If something parks the display warm and never releases it, True Tone stays paused
+by design. `truetone adopt`, or toggling it off and on, claims the display back.
+Startup is deliberately conservative here and will not seize a warm display it did
+not set.
+
 ## Known issue: the Night Light toggle inverts while this is running
 
 Omarchy decides whether Night Light is on by reading the current hyprsunset
@@ -144,9 +176,8 @@ omarchy-shell nightlight enable    # True Tone yields, holds at 4000 K
 omarchy-shell nightlight disable   # True Tone resumes
 ```
 
-True Tone detects Night Light taking the display and stands down rather than
-fighting it for the colour transform, then resumes when the display returns to
-neutral. That part is solid; only the toggle's own state detection is confused.
+True Tone itself handles this correctly, as described above. What is confused is
+Night Light's own view of whether it is on.
 
 This is an upstream design collision rather than something this plugin can fix on
 its own: any plugin that drives hyprsunset hits it. Two candidate fixes upstream
