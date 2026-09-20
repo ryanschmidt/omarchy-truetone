@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "ryanschmidt.truetone",
+  "name": "True Tone",
+  "version": "0.1.0",
+  "author": "Ryan Schmidt",
+  "license": "MIT",
+  "description": "Matches the display white point to the color of the light in your room, using the ambient color sensor. A True Tone equivalent for Omarchy.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "True Tone",
+    "description": "Shows the measured room color temperature and toggles ambient white point adaptation.",
+    "category": "Display",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showRoomKelvin": true,
+      "refreshIntervalSec": 3
+    },
+    "schema": [
+      {
+        "key": "showRoomKelvin",
+        "type": "boolean",
+        "label": "Show measured room temperature in the bar",
+        "defaultValue": true
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Bar refresh interval (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3
+      }
+    ]
+  }
+}
