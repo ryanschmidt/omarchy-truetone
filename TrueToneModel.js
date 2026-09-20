@@ -176,6 +176,46 @@ function externallyChanged(appliedK, lastSetK, tolerance) {
 }
 
 // ---------------------------------------------------------------------------
+// Pacing
+// ---------------------------------------------------------------------------
+
+// Room lighting changes over minutes, not seconds, so a fixed fast poll spends
+// almost all of its budget confirming that nothing happened. Poll fast only
+// while something is actually moving.
+var PACING = {
+  fastIntervalSec: 2,     // converging, or the room is changing
+  idleIntervalSec: 20,    // settled
+  // A room reading wobbles by roughly +/- 20K at rest. Anything under this is
+  // not the light changing, it is the sensor breathing.
+  stableCctDeltaK: 40
+}
+
+function isSettled(state, opts) {
+  if (!state) return false
+  // Still ramping toward the target: stay fast.
+  if (nextStep(state.appliedK, state.targetK, opts) !== null) return false
+  // Reading is drifting: stay fast so we catch the change early.
+  if (isFinite(state.previousCct) && isFinite(state.cct)) {
+    if (Math.abs(state.cct - state.previousCct) > PACING.stableCctDeltaK) return false
+  }
+  return true
+}
+
+function pollIntervalFor(settled, fastSec, idleSec) {
+  var fast = isFinite(fastSec) && fastSec > 0 ? fastSec : PACING.fastIntervalSec
+  var idle = isFinite(idleSec) && idleSec > 0 ? idleSec : PACING.idleIntervalSec
+  return settled ? Math.max(fast, idle) : fast
+}
+
+// The hyprctl probe is the only remaining subprocess in the steady state, and
+// it exists solely to notice Night Light taking over. Once settled, checking
+// that every tick is waste; a slower cadence still catches it promptly.
+function shouldProbe(ticksSinceProbe, settled) {
+  if (!settled) return true
+  return ticksSinceProbe >= 3
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -219,6 +259,41 @@ function parseConfig(text) {
   return out
 }
 
+// Written back whenever the panel changes a knob, so the file stays the single
+// source of truth and hand edits survive a round trip.
+function renderConfig(values) {
+  var v = optionsWithDefaults(values)
+  var poll = (values && isFinite(values.pollIntervalSec)) ? values.pollIntervalSec : 2
+  return [
+    "# omarchy true tone. Managed by the panel, safe to hand edit.",
+    "",
+    "# How far to move toward the room colour, 0 to 1.",
+    "strength = " + v.strength,
+    "",
+    "# Warmest the display may go.",
+    "minKelvin = " + Math.round(v.minKelvin),
+    "",
+    "# Coolest. Above " + NEUTRAL_K + " tints the panel blue.",
+    "maxKelvin = " + Math.round(v.maxKelvin),
+    "",
+    "# Below this many lux, hold rather than sample.",
+    "luxFloor = " + Math.round(v.luxFloor),
+    "",
+    "# Kelvin per tick while ramping.",
+    "maxStepK = " + Math.round(v.maxStepK),
+    "",
+    "# Seconds between sensor reads.",
+    "pollIntervalSec = " + Math.round(poll),
+    ""
+  ].join("\n")
+}
+
+function saveConfigCommand(values) {
+  return ["bash", "-lc",
+    "mkdir -p ~/.config/omarchy && cat > " + configPath() + " <<'TRUETONE_EOF'\n" +
+    renderConfig(values) + "TRUETONE_EOF"]
+}
+
 function temperatureFromOutput(output) {
   var match = String(output === undefined || output === null ? "" : output).match(/[0-9]+/)
   return match ? Number(match[0]) : null
@@ -242,9 +317,15 @@ if (typeof module !== "undefined") {
     readCommand: readCommand,
     parseReading: parseReading,
     hasUsableLight: hasUsableLight,
+    PACING: PACING,
+    isSettled: isSettled,
+    pollIntervalFor: pollIntervalFor,
+    shouldProbe: shouldProbe,
     configPath: configPath,
     loadConfigCommand: loadConfigCommand,
     parseConfig: parseConfig,
+    renderConfig: renderConfig,
+    saveConfigCommand: saveConfigCommand,
     adaptTarget: adaptTarget,
     smooth: smooth,
     nextStep: nextStep,

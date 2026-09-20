@@ -170,6 +170,38 @@ test("parses hyprctl output the way Omarchy's nightlight does", function () {
   assert.strictEqual(M.temperatureFromOutput(""), null)
 })
 
+console.log("\npacing")
+
+test("stays fast while still ramping", function () {
+  var settled = M.isSettled({ appliedK: 6000, targetK: 4200, cct: 2000, previousCct: 2000 })
+  assert.strictEqual(settled, false)
+})
+
+test("stays fast while the room is actually changing", function () {
+  var settled = M.isSettled({ appliedK: 4250, targetK: 4250, cct: 4600, previousCct: 2000 })
+  assert.strictEqual(settled, false)
+})
+
+test("settles when at target and the reading is only breathing", function () {
+  var settled = M.isSettled({ appliedK: 4250, targetK: 4250, cct: 1985, previousCct: 2000 })
+  assert.strictEqual(settled, true)
+})
+
+test("backs off the poll once settled", function () {
+  assert.strictEqual(M.pollIntervalFor(false, 2, 20), 2)
+  assert.strictEqual(M.pollIntervalFor(true, 2, 20), 20)
+})
+
+test("never backs off below the configured fast interval", function () {
+  assert.strictEqual(M.pollIntervalFor(true, 30, 20), 30)
+})
+
+test("probes hyprctl every tick while moving, sparsely when settled", function () {
+  assert.strictEqual(M.shouldProbe(0, false), true)
+  assert.strictEqual(M.shouldProbe(0, true), false)
+  assert.strictEqual(M.shouldProbe(3, true), true)
+})
+
 console.log("\nconfig")
 
 test("reads the knobs people will actually turn", function () {
@@ -201,6 +233,23 @@ test("survives a missing or garbage config", function () {
   assert.deepStrictEqual(M.parseConfig(""), {})
   assert.deepStrictEqual(M.parseConfig(null), {})
   assert.deepStrictEqual(M.parseConfig("strength=banana"), {})
+})
+
+test("round trips: what we write is what we read back", function () {
+  var wanted = { strength: 0.65, minKelvin: 3400, maxKelvin: 6200, luxFloor: 5, maxStepK: 120, pollIntervalSec: 4 }
+  var back = M.parseConfig(M.renderConfig(wanted))
+  assert.strictEqual(back.strength, 0.65)
+  assert.strictEqual(back.minKelvin, 3400)
+  assert.strictEqual(back.maxKelvin, 6200)
+  assert.strictEqual(back.luxFloor, 5)
+  assert.strictEqual(back.maxStepK, 120)
+  assert.strictEqual(back.pollIntervalSec, 4)
+})
+
+test("rendered config carries no shell metacharacters that would break the heredoc", function () {
+  var text = M.renderConfig({ strength: 0.5 })
+  assert.strictEqual(text.indexOf("TRUETONE_EOF"), -1)
+  assert.strictEqual(/[`$\\]/.test(text), false)
 })
 
 console.log("\nend to end")

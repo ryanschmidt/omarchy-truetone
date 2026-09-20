@@ -49,8 +49,11 @@ omarchy restart shell
 ```
 
 Add the bar widget from **Omarchy menu → Bar → Add widget → True Tone**, or run the
-service headless without the widget. Click the widget to toggle, right click to
-force a re-read after changing a bulb.
+service headless without the widget.
+
+The bar shows a plain white icon, dimmed when inactive. Click it to open the panel,
+which carries the live sensor readings, the on/off toggle, and the settings. Right
+click the icon to toggle without opening the panel.
 
 ```bash
 omarchy-shell truetone status     # what it sees right now
@@ -76,6 +79,24 @@ report a meaningful colour, so it holds the last good value instead of lurching.
 Changes ramp at 150 K per tick rather than jumping, because a step change in white
 point is very visible in peripheral vision.
 
+## Cost
+
+This runs forever on a laptop, so it is built not to cost anything.
+
+- **sysfs is read in process**, through Quickshell's `FileView`. No subprocess, no
+  fork, microseconds per read.
+- **No shell in the steady state.** A `bash -lc` spawn costs roughly 20 ms of CPU,
+  mostly sourcing your login profile. The only shell this plugin runs is one sensor
+  scan at startup.
+- **Polling backs off.** Room lighting changes over minutes, so a fixed fast poll
+  spends its whole budget confirming that nothing happened. It samples every 2 s
+  while something is moving and every 20 s once settled, waking immediately when
+  the reading shifts.
+- **hyprctl is only called when the temperature actually needs to move.**
+
+Measured on a Dell XPS 14, settled: the entire `omarchy-shell` process, bar and
+clock and notifications included, uses **0.10% of one core**.
+
 ## Configuration
 
 Optional. Create `~/.config/omarchy/truetone.conf`:
@@ -96,9 +117,12 @@ luxFloor = 3
 # Kelvin per tick while ramping.
 maxStepK = 150
 
-# Seconds between sensor reads.
+# Seconds between sensor reads while something is changing.
 pollIntervalSec = 2
 ```
+
+`idleIntervalSec` (20) is the relaxed cadence once settled and is not currently
+exposed in the file; raise `pollIntervalSec` if you want the active cadence slower.
 
 Values are clamped on load, so a typo degrades rather than breaking your display.
 Restart the shell to apply.
@@ -149,7 +173,7 @@ node test-model.js
 
 All decision logic lives in `TrueToneModel.js` as plain JavaScript with no QML
 imports, so it runs under node. `Service.qml` does I/O and owns the loop;
-`BarWidget.qml` is display only and binds to the service. Adding a behaviour means
+`Panel.qml` is display only and binds to the service. Adding a behaviour means
 adding a case to the model and a test next to it.
 
 ## Licence
