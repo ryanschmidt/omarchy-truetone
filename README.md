@@ -96,9 +96,16 @@ Hyprland system already has. To build it by hand:
 
 ## How it decides
 
-**Partial adaptation.** It moves the display *partway* toward the room, not all
-the way. Your visual system is already adapting, so the panel only closes part of
-the gap; adapting fully to a 2000 K lamp looks alarmingly orange.
+**Partial adaptation, calibrated against a Mac.** It moves the display *partway*
+toward the room, not all the way: your visual system is already adapting, so the
+panel only closes part of the gap. The strength is not a guess. A MacBook with
+True Tone on was put beside this machine under the same lamp, both showing white,
+and the value was swept until they matched. `calibrate.sh` reproduces that.
+
+The resulting correction is small, and deliberately so. In a 2500 K evening room
+it takes about 6% off green and 9% off blue; in daylight it does nothing at all,
+because the correction scales with distance from D65 and neutral light is already
+there.
 
 **Measured chromaticity, not just temperature.** Warmth is interpolated in
 Kelvin, and the off-locus part of the measured colour is carried across

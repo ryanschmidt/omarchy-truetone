@@ -15,10 +15,20 @@ var D65_K = 6500
 
 // How far to move from D65 toward the room, in CIE xy. True Tone is a partial
 // adaptation, not a match: your eye is already adapting, so the display only
-// closes part of the gap. This is the one number that decides how the feature
-// feels, and it is deliberately small. An earlier 0.5 was chosen before the
-// transfer-function bug below was found, and it was doubling on top of that.
-var STRENGTH = 0.14
+// closes part of the gap.
+//
+// This value is MEASURED, not chosen. A MacBook with True Tone on was placed
+// beside this machine under the same 2500K/17lux lamp, both showing white,
+// and the strength was swept until they matched. 0.04 is where they did.
+//
+// It looks surprisingly small, and that is the point: the correction scales
+// with the distance from D65, so neutral lighting self-attenuates to nothing
+// while a warm evening room still gets a visible shift. Earlier values of 0.5
+// and 0.14 were guesses, and the first was compounding a transfer-function
+// bug on top.
+//
+// calibrate.sh reproduces the measurement.
+var STRENGTH = 0.04
 
 // The warmest white point we will produce, as a floor on the blue channel.
 // Only reached in candlelight at this strength.
