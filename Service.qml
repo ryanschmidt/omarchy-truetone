@@ -38,6 +38,9 @@ Item {
   property var targetK: null
   property bool settled: false
 
+  // Set by an explicit enable so the next application jumps rather than ramps.
+  property bool applyImmediately: false
+
   property bool samplePending: false
   property var sampleCct: null
   property var sampleLux: null
@@ -82,6 +85,7 @@ Item {
       root.smoothed = null
       root.previousCct = null
       root.settled = false
+      root.applyImmediately = true
       tick()
     }
   }
@@ -156,7 +160,8 @@ Item {
       root.targetK = goal.targetK
     }
 
-    var step = Model.stepGains(root.appliedGains, root.targetGains)
+    var step = Model.stepGains(root.appliedGains, root.targetGains, root.applyImmediately)
+    root.applyImmediately = false
     if (step) {
       root.appliedGains = step
       sendGains(step)

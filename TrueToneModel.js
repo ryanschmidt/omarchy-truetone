@@ -236,9 +236,15 @@ function smoothReading(previous, sample) {
 }
 
 // Walk each channel toward the target. Returns null when already there.
-function stepGains(current, target) {
+//
+// `immediate` skips the walk. The ramp exists so that a change in the ROOM is
+// imperceptible, but a user flipping the switch wants to see the result: a
+// deliberate toggle took 18 seconds to creep from neutral to target, which
+// reads as nothing happening. Disable was already instant, so this also makes
+// the two directions symmetric.
+function stepGains(current, target, immediate) {
   if (!target) return null
-  if (!current) return { r: target.r, g: target.g, b: target.b }
+  if (!current || immediate) return { r: target.r, g: target.g, b: target.b }
   var dr = target.r - current.r
   var dg = target.g - current.g
   var db = target.b - current.b

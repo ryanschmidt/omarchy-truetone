@@ -173,6 +173,16 @@ test("ramp is capped per tick", function () {
   assert.ok(s.b > 0.98, "jumped too far: " + s.b)
 })
 
+test("an explicit toggle applies immediately instead of ramping", function () {
+  // A deliberate enable used to creep from neutral to target over 18 seconds,
+  // which reads as the feature doing nothing. Disable was already instant.
+  var target = { r: 1, g: 0.925, b: 0.894 }
+  var ramped = M.stepGains({ r: 1, g: 1, b: 1 }, target)
+  assert.ok(ramped.b > 0.98, "ramp should still be gradual: " + ramped.b)
+  var jumped = M.stepGains({ r: 1, g: 1, b: 1 }, target, true)
+  assert.deepStrictEqual(jumped, target)
+})
+
 test("deadband suppresses invisible changes", function () {
   assert.strictEqual(M.stepGains({ r: 1, g: 0.9, b: 0.8 }, { r: 1, g: 0.9, b: 0.801 }), null)
 })
