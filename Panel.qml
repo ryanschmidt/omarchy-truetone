@@ -37,6 +37,8 @@ Panel {
     if (!serviceReady) return ""
     if (!service.sensorHasColor) return service.unavailableReason || "Unsupported hardware"
     if (service.helperError && service.helperError !== "") return service.helperError
+    if (service.helperReady && service.applying === false)
+      return "the compositor is not accepting the correction"
     return ""
   }
 
@@ -193,7 +195,10 @@ Panel {
           model: [
             { label: "Room light", value: root.roomKelvin > 0 ? root.roomKelvin + " K" : "-" },
             { label: "Brightness", value: root.reading ? root.roomLux + " lux" : "-" },
-            { label: "Display white point", value: root.targetKelvin ? root.targetKelvin + " K" : "-" }
+            { label: "Display white point", value: root.targetKelvin ? root.targetKelvin + " K" : "-" },
+            { label: "Displays corrected",
+              value: root.serviceReady
+                ? root.service.outputsApplied + " of " + root.service.outputCount : "-" }
           ]
 
           delegate: Item {

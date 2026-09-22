@@ -29,6 +29,10 @@ Item {
   property bool helperReady: false
   property string helperError: ""
   property int outputCount: 0
+  // What the helper reports it is ACTUALLY driving. The panel used to show
+  // success whenever the helper was alive, which hid a refused gamma control
+  // for a whole session.
+  property int outputsApplied: 0
 
   property var reading: null          // { cct, lux, x, y }
   property var smoothed: null    // EMA of { cct, x, y }, smoothed together
@@ -52,8 +56,10 @@ Item {
   property real xyScale: 0.001
   property int scalesLoaded: 0
 
+  // Applying to nothing is not working, however healthy the rest looks.
+  readonly property bool applying: helperReady && outputsApplied > 0
   readonly property bool supported: ready && sensorHasColor && helperReady
-  readonly property bool active: supported && enabled
+  readonly property bool active: supported && enabled && applying
 
   readonly property string statusText: {
     if (!ready) return "starting"
@@ -61,6 +67,7 @@ Item {
     if (helperError !== "") return helperError
     if (!helperReady) return "starting"
     if (!enabled) return "off"
+    if (!applying) return "display not accepting the correction"
     if (!reading) return "no reading"
     if (!Model.hasUsableLight(reading.lux)) return "too dark to sample"
     return Model.describe(reading, targetK)
@@ -293,6 +300,18 @@ Item {
           root.helperReady = true
           root.helperError = ""
           if (root.enabled) root.tick()
+        } else if (s.indexOf("STATUS") === 0) {
+          var m = s.match(/outputs=(\d+)\s+applied=(\d+)/)
+          if (m) {
+            root.outputCount = parseInt(m[1])
+            root.outputsApplied = parseInt(m[2])
+          }
+        } else if (s.indexOf("SET") === 0) {
+          var a = s.match(/applied=(\d+)\/(\d+)/)
+          if (a) {
+            root.outputsApplied = parseInt(a[1])
+            root.outputCount = parseInt(a[2])
+          }
         }
       }
     }
@@ -377,6 +396,8 @@ Item {
         hasColorChannel: root.sensorHasColor,
         helperReady: root.helperReady,
         outputs: root.outputCount,
+        outputsApplied: root.outputsApplied,
+        applying: root.applying,
         reason: root.unavailableReason || root.helperError,
         roomKelvin: root.reading ? Math.round(root.reading.cct) : null,
         lux: root.reading ? Math.round(root.reading.lux) : null,

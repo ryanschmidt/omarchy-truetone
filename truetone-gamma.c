@@ -21,6 +21,7 @@
 // tinted screen. On exit the compositor restores the original ramps.
 
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,8 @@
 #include <signal.h>
 #include <poll.h>
 #include <libgen.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <math.h>
 #include <wayland-client.h>
 #include "wlr-gamma-control-unstable-v1-client-protocol.h"
@@ -42,13 +45,21 @@
 struct output_state {
   struct wl_output *output;
   uint32_t name;                          // registry name, for hotplug removal
+  uint32_t version;
   struct zwlr_gamma_control_v1 *gamma;
   uint32_t ramp_size;
   int fd;
   uint16_t *table;
   int ready;
-  int failed;
+  int failed;          // refused; retried rather than abandoned
+  int retries;
 };
+
+// How long to wait before asking again for a refused output, and how many
+// times. A refusal is usually a previous instance of this helper that has not
+// finished exiting, so the control frees itself within a second or two.
+#define RETRY_MS 1500
+#define MAX_RETRIES 20
 
 static struct wl_display *display;
 static struct wl_registry *registry;
@@ -58,6 +69,8 @@ static int output_count;
 static double cur_r = 1.0, cur_g = 1.0, cur_b = 1.0;
 
 static void apply_one(struct output_state *o, double r, double g, double b);
+static void release_output(struct output_state *o);
+static void acquire_output(struct output_state *o);
 
 // ---- gamma control listener ------------------------------------------------
 
@@ -82,6 +95,8 @@ static void gamma_size(void *data, struct zwlr_gamma_control_v1 *gc, uint32_t si
   if (o->table == MAP_FAILED) { o->table = NULL; o->failed = 1; return; }
 
   o->ready = 1;
+  o->failed = 0;
+  o->retries = 0;
   // A newly attached output should match whatever is currently set, so a
   // monitor plugged in mid-session does not sit at identity.
   apply_one(o, cur_r, cur_g, cur_b);
@@ -91,10 +106,16 @@ static void gamma_size(void *data, struct zwlr_gamma_control_v1 *gc, uint32_t si
 // the rest of the outputs keep working.
 static void gamma_failed(void *data, struct zwlr_gamma_control_v1 *gc) {
   struct output_state *o = data;
+  // Refusal used to be permanent, which meant a transient conflict silently
+  // disabled the correction for the rest of the session while the service
+  // still reported success. Drop the control and ask again.
+  release_output(o);
   o->failed = 1;
-  o->ready = 0;
-  fprintf(stderr, "truetone-gamma: gamma control refused for one output "
-                  "(another client holds it)\n");
+  if (o->retries < MAX_RETRIES) {
+    fprintf(stderr, "truetone-gamma: output %u refused, retrying\n", o->name);
+  } else {
+    fprintf(stderr, "truetone-gamma: output %u refused, giving up\n", o->name);
+  }
   fflush(stderr);
 }
 
@@ -151,6 +172,34 @@ static void apply_one(struct output_state *o, double r, double g, double b) {
   zwlr_gamma_control_v1_set_gamma(o->gamma, dup_fd);
 }
 
+// How many outputs are actually carrying the ramp. The service prints this,
+// so "applied" in the panel means applied, not merely "the helper is alive".
+static int outputs_ready(void) {
+  int n = 0;
+  for (int i = 0; i < output_count; i++) if (outputs[i].ready) n++;
+  return n;
+}
+
+static void report_status(void) {
+  printf("STATUS outputs=%d applied=%d\n", output_count, outputs_ready());
+  fflush(stdout);
+}
+
+// Ask again for anything that was refused. Returns 1 if more retries are due.
+static int retry_pending(void) {
+  int pending = 0;
+  for (int i = 0; i < output_count; i++) {
+    struct output_state *o = &outputs[i];
+    if (o->ready || !o->failed) continue;
+    if (o->retries >= MAX_RETRIES) continue;
+    o->retries++;
+    acquire_output(o);
+    pending = 1;
+  }
+  if (pending) wl_display_flush(display);
+  return pending;
+}
+
 static void apply_all(double r, double g, double b) {
   cur_r = r; cur_g = g; cur_b = b;
   for (int i = 0; i < output_count; i++) apply_one(&outputs[i], r, g, b);
@@ -159,18 +208,46 @@ static void apply_all(double r, double g, double b) {
 
 // ---- registry --------------------------------------------------------------
 
+// Ask the compositor for this output's gamma control. Safe to call again
+// after a refusal.
+static void acquire_output(struct output_state *o) {
+  if (!manager || !o->output || o->gamma) return;
+  o->gamma = zwlr_gamma_control_manager_v1_get_gamma_control(manager, o->output);
+  zwlr_gamma_control_v1_add_listener(o->gamma, &gamma_listener, o);
+}
+
+static void release_output(struct output_state *o) {
+  if (o->gamma) { zwlr_gamma_control_v1_destroy(o->gamma); o->gamma = NULL; }
+  if (o->table) {
+    munmap(o->table, (size_t)o->ramp_size * 3 * sizeof(uint16_t));
+    o->table = NULL;
+  }
+  if (o->fd >= 0) { close(o->fd); o->fd = -1; }
+  o->ready = 0;
+}
+
+// Outputs are keyed by registry name. Hyprland re-advertises wl_output across
+// mode changes, lid events and sleep, and binding the same one twice produced
+// several controls for one monitor: the compositor grants exactly one per
+// output and refused the rest, so a single laptop panel reported as three
+// outputs with two permanently refused.
+static struct output_state *find_output(uint32_t name) {
+  for (int i = 0; i < output_count; i++)
+    if (outputs[i].name == name) return &outputs[i];
+  return NULL;
+}
+
 static void add_output(uint32_t name, uint32_t version) {
   if (output_count >= MAX_OUTPUTS) return;
+  if (find_output(name)) return;                 // already have this one
   struct output_state *o = &outputs[output_count];
   memset(o, 0, sizeof(*o));
   o->fd = -1;
   o->name = name;
-  o->output = wl_registry_bind(registry, name, &wl_output_interface,
-                               version < 4 ? version : 4);
-  if (!manager) return;
-  o->gamma = zwlr_gamma_control_manager_v1_get_gamma_control(manager, o->output);
-  zwlr_gamma_control_v1_add_listener(o->gamma, &gamma_listener, o);
-  output_count++;
+  o->version = version < 4 ? version : 4;
+  o->output = wl_registry_bind(registry, name, &wl_output_interface, o->version);
+  output_count++;      // count it even if the manager is not bound yet
+  acquire_output(o);   // no-op until the manager arrives
 }
 
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
@@ -178,23 +255,21 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
   if (!strcmp(iface, zwlr_gamma_control_manager_v1_interface.name)) {
     manager = wl_registry_bind(reg, name,
                                &zwlr_gamma_control_manager_v1_interface, 1);
+    // Globals can arrive in any order. Outputs seen before the manager were
+    // recorded without a control; give them one now.
+    for (int i = 0; i < output_count; i++) acquire_output(&outputs[i]);
   } else if (!strcmp(iface, wl_output_interface.name)) {
     add_output(name, version);
   }
 }
 
 static void registry_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
-  for (int i = 0; i < output_count; i++) {
-    if (outputs[i].name != name) continue;
-    if (outputs[i].gamma) zwlr_gamma_control_v1_destroy(outputs[i].gamma);
-    if (outputs[i].table) munmap(outputs[i].table,
-                                 (size_t)outputs[i].ramp_size * 3 * sizeof(uint16_t));
-    if (outputs[i].fd >= 0) close(outputs[i].fd);
-    if (outputs[i].output) wl_output_destroy(outputs[i].output);
-    outputs[i] = outputs[output_count - 1];
-    output_count--;
-    return;
-  }
+  struct output_state *o = find_output(name);
+  if (!o) return;
+  release_output(o);
+  if (o->output) wl_output_destroy(o->output);
+  *o = outputs[output_count - 1];
+  output_count--;
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -225,6 +300,33 @@ int main(int argc, char **argv) {
 
   // Die with the shell rather than stranding a tinted screen.
   prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+  // One instance only. A plugin reload starts a new helper while the old one
+  // may still hold the gamma controls, and the newcomer was then refused for
+  // every output. Take an exclusive lock; if another instance holds it, ask it
+  // to exit and wait briefly for it to let go.
+  char lockpath[512];
+  snprintf(lockpath, sizeof(lockpath), "%s.lock", gains_path);
+  int lockfd = open(lockpath, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+  if (lockfd >= 0) {
+    for (int attempt = 0; attempt < 40; attempt++) {
+      if (flock(lockfd, LOCK_EX | LOCK_NB) == 0) break;
+      if (attempt == 0) {
+        char buf[32] = {0};
+        lseek(lockfd, 0, SEEK_SET);
+        if (read(lockfd, buf, sizeof(buf) - 1) > 0) {
+          int other = atoi(buf);
+          if (other > 0 && other != getpid()) kill(other, SIGTERM);
+        }
+      }
+      usleep(100000);
+    }
+    if (ftruncate(lockfd, 0) == 0) {
+      char me[32];
+      int n = snprintf(me, sizeof(me), "%d\n", (int)getpid());
+      if (write(lockfd, me, n) != n) { /* advisory only */ }
+    }
+  }
 
   // Load before connecting: gamma_size applies cur_* as each output appears,
   // so there is exactly one write per output rather than two.
@@ -274,6 +376,7 @@ int main(int argc, char **argv) {
 
   printf("READY %d\n", output_count);
   fflush(stdout);
+  report_status();
 
   struct pollfd fds[2];
   fds[0].fd = wl_display_get_fd(display); fds[0].events = POLLIN;
@@ -284,10 +387,24 @@ int main(int argc, char **argv) {
     while (wl_display_prepare_read(display) != 0) wl_display_dispatch_pending(display);
     wl_display_flush(display);
 
-    if (poll(fds, 2, -1) < 0) {
+    int need_retry = 0;
+    for (int i = 0; i < output_count && !need_retry; i++)
+      if (!outputs[i].ready && outputs[i].failed && outputs[i].retries < MAX_RETRIES)
+        need_retry = 1;
+
+    int rc = poll(fds, 2, need_retry ? RETRY_MS : -1);
+    if (rc < 0) {
       wl_display_cancel_read(display);
       if (errno == EINTR) continue;
       break;
+    }
+    if (rc == 0) {                 // timed out: reacquire refused outputs
+      wl_display_cancel_read(display);
+      int before = outputs_ready();
+      retry_pending();
+      wl_display_roundtrip(display);
+      if (outputs_ready() != before) report_status();
+      continue;
     }
 
     if (fds[0].revents & POLLIN) {
@@ -307,7 +424,8 @@ int main(int argc, char **argv) {
       }
       if (touched && read_gains_file(gains_path, &r, &g, &b)) {
         apply_all(r, g, b);
-        printf("SET %.3f %.3f %.3f\n", r, g, b);
+        printf("SET %.3f %.3f %.3f applied=%d/%d\n", r, g, b,
+               outputs_ready(), output_count);
         fflush(stdout);
       }
     }
